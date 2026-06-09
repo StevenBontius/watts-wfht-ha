@@ -1,0 +1,32 @@
+# Captures default location (large files, do not commit)
+captures/
+*.cu8
+*.iq
+*.wav
+ 
+# Vendor manuals kept locally for reference but not redistributed
+# (third-party copyright; mirror them to your own machine only)
+references/manuals/
+docs/references/manuals/
+ 
+# Python
+__pycache__/
+*.pyc
+.venv/
+.mypy_cache/
+.pytest_cache/
+ 
+# macOS
+.DS_Store
+ 
+# Editors
+.vscode/
+.idea/
+*.swp
+ 
+# Local secrets
+*.env
+secrets.yaml
+
+# personal settings
+docs/home.md
