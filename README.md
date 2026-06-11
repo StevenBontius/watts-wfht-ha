@@ -6,7 +6,10 @@ cooling and dewpoint safety designed and parked for a later phase.
 
 **Status:** phase 0, capture and protocol characterisation complete.
 
-[Watts WFHT RF Protocol](docs/WATTS_WFHT_RF_PROTOCOL.md)
+[Watts WFHT RF Protocol reverse engineering](docs/WATTS_WFHT_RF_PROTOCOL.md)
+
+All reverse engineering findings have been incorporated into this [forked rtl_433 decoder](https://github.com/StevenBontius/rtl_433). Pending merge with rtl-433.
+
 
 ## What this project is
 
