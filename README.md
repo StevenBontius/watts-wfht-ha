@@ -4,7 +4,9 @@ Replacing Watts WFHT-RF underfloor heating thermostats with a Home
 Assistant bridge running on an ESP32 + CC1101. Heating-first MVP, with
 cooling and dewpoint safety designed and parked for a later phase.
 
-**Status:** phase 0, capture and protocol characterisation.
+**Status:** phase 0, capture and protocol characterisation complete.
+
+[Watts WFHT RF Protocol](docs/WATTS_WFHT_RF_PROTOCOL.md)
 
 ## What this project is
 
