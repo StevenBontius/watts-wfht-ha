@@ -28,5 +28,9 @@ __pycache__/
 *.env
 secrets.yaml
 
+# PlatformIO
+firmware/.pio/
+firmware/include/config.h
+
 # personal settings
 docs/home.md

@@ -1,150 +1,102 @@
-# watts-wfht-ha
+# Smart Retrofit RF Bridge: Watts WFHT-RF Emulator
 
-Replacing Watts WFHT-RF underfloor heating thermostats with a Home
-Assistant bridge running on an ESP32 + CC1101. Heating-first MVP, with
-cooling and dewpoint safety designed and parked for a later phase.
+Replacing Watts WFHT-RF legacy underfloor heating thermostats with a headless Home Assistant bridge running on an ESP32 + CC1101.
 
-**Status:** phase 0, capture and protocol characterisation complete.
+By intercepting the proprietary RF layer of existing HVAC installations, this bridge modernizes disconnected hydronic underfloor heating (UFH) systems without requiring an expensive mechanical overhaul of the manifold, valves, or pumps.
 
-[Watts WFHT RF Protocol reverse engineering](docs/WATTS_WFHT_RF_PROTOCOL.md)
+**Status:** Phase 1 Capture and protocol characterization complete.
 
-All reverse engineering findings have been incorporated into this [forked rtl_433 decoder](https://github.com/StevenBontius/rtl_433). Pending merge with rtl-433.
+[Watts WFHT RF Protocol Reverse Engineering](/docs/WATTS_WFHT_RF_PROTOCOL.md)
 
+All reverse engineering findings for capturing packets have been incorporated into this [forked rtl_433 decoder](https://github.com/StevenBontius/rtl_433). Pending merge with mainline `rtl-433`.
 
-## What this project is
+## The Problem vs. The Solution
 
-The house has two coupled Watts WFHT-RF systems on 433.92 MHz, sharing
-a Panasonic Aquarea heat pump:
+**The Problem:** Millions of homes run on durable mechanical underfloor heating manifolds installed in the 2000s and 2010s. However, their wireless wall thermostats are outdated and lack smart connectivity. Systems get obsolete and are hard to come by. Fully replacing the control block, actuators, and thermostats is a massive expense.
 
-- **Upstairs:** four zones (three bedrooms and one bathroom), each
-  zone driving two manifold loops, controlled by its own Watts central
-  receiver.
-- **Downstairs:** one zone covering eight manifold loops across the
-  ground-floor open-plan area, controlled by its own Watts central
-  receiver.
+**The Solution:** A single, low-cost hardware bridge that completely spoofs the original wireless thermostats. The existing manifold receiver is still operating as originally designed extending its lifespan while bringing it into the smart era.
 
-The two centrals are linked by a cool/heat signal wire that propagates
-the cooling mode from one unit to the other. The downstairs central
-also has a voltage-free humidity contact input, used as an emergency
-stop in the cooling phase. The existing damp-floor problem is
-downstairs-only, driven by cooking with a recirculating cooker hood
-that dumps humid air at floor level.
+## System Architecture & Data Flow
 
-The bridge keeps every piece of mechanical hardware in place: both
-receivers, the servo valves on both manifolds, all the loops. What
-changes is the source of the thermostat packets. Instead of physical
-Watts thermostats on the wall, an ESP32 with a CC1101 radio transmits
-packets on the same device IDs from a central location, and Home
-Assistant drives what those packets contain.
+The bridge functions as a silent translator, decoupling the user interface from the physical heating execution layer. 
 
 ### How a setpoint reaches the floor
 
-```
+Uses an Aqara w100 thermostat, but could use any thermostat that can be coupled to Home Assistant or publish its temperature and setpoint to an MQTT broker.
+
+```text
 Aqara W100 (temp + humidity + up/down/scene buttons)
         │
         ▼  (Zigbee via Zigbee2MQTT)
    Home Assistant
-        │     measured room temp: relayed directly into the packet
-        │     setpoint:           from HA schedule or automation,
-        │                         or from W100 up/down buttons,
-        │                         subject to the per-zone lock
+        │     measured room temp: Relayed to MQTT topic
+        │     setpoint:           From HA schedule/automation or local W100 
+        │                         buttons (subject to parental lock)
         ▼
-   ESP32 + CC1101
+   MQTT Broker
         │
-        ▼  (433.92 MHz, spoofed Watts WFHT-RF packet)
-  Watts central receiver
+        ▼  (Subscribed by ESPHome Custom Component)
+   ESP32 (Edge Intelligence Layer)
+        │     - Runs local PI control loop (Bp=2.0°C, Cy=900s, On/Of=120s)
+        │     - Calculates active duty fraction and target call-for-heat flag (0x64 or 0x00)
+        │     - Calculates custom application CRC-8
+        ▼
+   CC1101 Radio Transceiver
+        │     - Formats 192-bit fixed packet with 0xD391 sync word
+        │     - Transmits A-B-A burst every 154 seconds (or instantly on state change)
+        ▼  (433.92 MHz, spoofed Watts WFHT-RF OOK Manchester packet)
+  Watts Central Receiver
         │
         ▼
-   Manifold servo for the zone, driving its loop(s)
+   Manifold servo for the zone opens/closes the water loop
+
 ```
 
-The Watts receiver still makes the actual decision (open or close the
-valve) by comparing measured temperature with the setpoint inside the
-packet, exactly as it does for the original thermostats. Home Assistant
-is not reimplementing a thermostat; it is feeding the existing one its
-inputs.
+### Edge Resiliency
 
-### Local input and parental lock
+The architecture features layered redundancy to ensure the system remains safe and stable even if components or network connections fail:
 
-The Aqara W100's up and down buttons are the in-room control for
-adjusting the setpoint of that zone. The button presses come into Home
-Assistant as Zigbee events and update the HA setpoint, which the next
-transmitted Watts packet carries down to the receiver.
+* **Inherent Hardware Failsafe**: The physical Watts manifold receiver expects a regular heartbeat. If the ESP32 bridge loses power or suffers a critical hardware failure and stops transmitting its 154-second steady-state broadcasts, the Watts receiver detects the signal loss and automatically drops the affected zones into a safe, factory-default state.
 
-Each zone has a lock toggle in Home Assistant. When a zone is locked,
-button presses for that zone are ignored, so a child cannot override
-the parent's schedule from their bedroom. Unlocking restores normal
-button behaviour. The lock can be flipped per zone from any HA
-dashboard.
+* **Edge Intelligence (Short-Term Resiliency)**: Because the chronoproportional PI control loop runs directly on the ESP32 microcontroller, the system gracefully handles brief upstream disconnections. If Home Assistant restarts or the Wi-Fi drops temporarily, the ESP32 continues executing the active PI loop using the last known setpoint and ambient temperature.
 
-### Spoofing and pairing
+* **Software Timeout Failsafe (Extended Network Drop)**: To prevent runaway heating or freezing based on stale data, the ESP32 monitors the age of incoming MQTT payloads. If no valid sensor update or heartbeat is received from Home Assistant within a defined safety window (e.g., 60 minutes), the ESP32 aborts the active control loop. It will explicitly transmit an idle flag (0x00) to the Watts receiver, forcing the system into a failsafe standby or frost-protection mode until network communication is reliably reestablished.
 
-The bridge needs both capabilities in the MVP:
+### Headless Integration & Local Input
 
-1. **Spoofing existing device IDs.** For thermostats that still work,
-   we read their device ID from captured packets and the ESP32 sends
-   packets carrying the same ID. The Watts receiver cannot tell the
-   difference.
-2. **Pairing new virtual device IDs.** One existing thermostat is
-   currently broken and needs replacement, and the downstairs zone
-   will later be subdivided into multiple separately controlled zones.
-   Both require new device IDs to be registered with the Watts
-   receivers. This is why pairing must be in the MVP, not deferred.
+The bridge works entirely behind the scenes via background MQTT topics. It does not generate cluttered, duplicate climate dashboard entities in Home Assistant, allowing the user interface to remain focused on modern smart sensors like the Aqara W100.
 
-### What rtl_433 already provides
+Each zone features a lock toggle in Home Assistant. When a zone is locked, local Zigbee button presses for that zone are ignored, preventing accidental or unauthorized schedule overrides.
 
-Watts WFHT-RF is mainline rtl_433 protocol 253 since version 24.10
-(PR #2648). The decoder yields device ID, measured temperature,
-setpoint, and a flags field. No custom decoder needed.
+### Spoofing and Pairing Capabilities
 
-Remaining unknowns at the start of this project:
+The bridge requires both capabilities for MVP:
 
-- Heartbeat timing: how long without a packet before the Watts receiver
-  drops a zone into a failsafe state, and what that failsafe state is
-- Pairing procedure: how to register a new device ID with the receiver
-- Cooling/heating flag bit: whether the mode lives inside the
-  thermostat packet, or comes from a separate broadcast by the central
-  controller (deferred to the cooling phase)
+1. **Spoofing existing device IDs:** For thermostats that still work, the ESP32 clones their 3-byte hardware identifier (e.g., `34:94:2B`). The Watts receiver cannot tell the difference.
+2. **Pairing new virtual device IDs:** To replace broken thermostats or subdivide zones, the ESP32 can initiate a pairing sequence. It achieves this by transmitting at a rapid 2 Hz cadence (~500 ms) with bit 0 of byte 12 set to `1`, registering a brand-new virtual thermostat with the physical Watts receiver.
 
 ### Hardware
 
-- Two Watts WFHT central RF receivers, coupled by a cool/heat signal
-  wire, each driving its own manifold with electrothermal servo valves
-- Downstairs central has a voltage-free humidity contact input
-  (reserved as the cooling-phase emergency stop)
-- Watts WFHT-LCD-RF wireless thermostats (currently in service; one is
-  broken and is the immediate replacement target)
-- Panasonic Aquarea heat pump with HeishaMon (Panasonic-native variant,
-  not the OpenTherm bridge)
-- Home Assistant OS on a NUC, with Zigbee2MQTT and Philips Hue already
-  running
-- Aqara W100 climate sensors, one per zone, paired via Zigbee2MQTT for
-  access to temperature, humidity, and button events
-- RTL-SDR V3 dongle for protocol capture, running on a Mac
-- Mechanical extraction ventilation without heat recovery
-- (planned) ESP32 DevKit C with CC1101 module for transmitting
+* **ESP32 DevKit C** with **CC1101** module for processing and transmitting.
+* Two Watts WFHT central RF receivers, coupled by a cool/heat signal wire, each driving its own manifold with electrothermal servo valves.
+* Downstairs central has a voltage-free humidity contact input (reserved as the cooling-phase emergency stop).
+* Watts WFHT-LCD-RF wireless thermostats (currently in service; one is broken and is the immediate replacement target).
+* Panasonic Aquarea heat pump with HeishaMon.
+* Home Assistant OS on a NUC, with Zigbee2MQTT.
+* Aqara W100 climate sensors (one per zone).
 
 ## Scope
 
 **In the heating MVP:**
 
-- All four upstairs zones plus the single downstairs zone running
-  through the bridge
-- Replacement of the broken thermostat as the first live deployment,
-  via a newly paired virtual device ID
-- Home Assistant owning setpoints (schedules, presence, holiday mode)
-  with W100 buttons as the per-room local override
-- Per-zone parental lock toggling local button input on or off
-- Standard failsafes: notifications on missing sensor data, on the
-  ESP32 going offline, on temperature drift outside expected envelopes
+* All four upstairs zones plus the single downstairs zone running through the ESP32 bridge.
+* Local execution of the chronoproportional PI loop on the ESP32 for edge resiliency.
+* Replacement of the broken thermostat via a newly paired virtual device ID.
+* Home Assistant owning setpoints (schedules, presence, holiday mode) with W100 buttons as the per-room local override.
+* Per-zone parental lock toggling local button input on or off.
 
 **Explicitly deferred to post-MVP phases:**
 
-- Cooling, dewpoint safety, cooking detection, and integration of the
-  downstairs humidity contact. Design exists in
-  [`docs/safety/cooling-and-dewpoint.md`](docs/safety/cooling-and-dewpoint.md).
-  Cooling is a downstairs-only concern in practice; the bathroom and
-  bedrooms are not cooled.
-- Downstairs zone subdivision into multiple separately controlled
-  zones (re-uses the pairing capability built for the MVP)
-- Upstreaming protocol findings to rtl_433
+* Cooling, dewpoint safety, cooking detection, and integration of the downstairs humidity contact. Design exists in `docs/safety/cooling-and-dewpoint.md`. Cooling is a downstairs-only concern.
+* Downstairs zone subdivision into multiple separately controlled zones.
+* Upstreaming protocol findings to mainline `rtl_433`.
