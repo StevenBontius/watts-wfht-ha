@@ -162,6 +162,8 @@ report the real ambient reading. Byte 20 transitions to `0x00` (no heat
 call). Byte 12 retains its heat/cool bit from before standby, suggesting
 the mode is preserved across off/on cycles rather than reset.
 
+Even when the thermostat is turned off via the switch on the side it will continue sending 0.0 setpoint packages.
+
 ### Byte 20: call-for-heat
 
 A single byte representing the thermostat's output to the central:
@@ -259,6 +261,8 @@ anti-short-cycle constraints (`On`, `Of`), and a compensation offset
 (`Cp`). A device exposing such parameters runs its own control loop; byte
 20 is the output of that loop. Characterizing it requires reconstructing
 not just an encoding but the algorithm that produces it.
+
+During testing it was confirmed that the simple EFHRFR 001 receiver only listens to the call for heat flag for controlling the valve. Actual temperatures and setpoints are not checked. So the EFHRFR 001 receiver relies on the control loop within the thermostat. Further research will need to be performed to see whether the other system does use the temperatures and ignores the call for heat flag. If the receiver does not receive a packet within a certain time (have't timed it but seems like 15 minutes) it will go into error mode. Green light flashing slow.
 
 ### Approach
 

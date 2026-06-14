@@ -19,6 +19,8 @@
  *   GET /status                                  radio + config info
  *   GET /tx-test                                 raw OOK smoke test
  *   GET /tx-watts?amb=22.5&sp=24.0&cfh=0&mode=heat   send a Watts A-B-A burst
+ *   GET /tx-pair?duration=30&mode=heat           send pairing frames at 2 Hz
+ *                                                (blocks for `duration` s)
  *
  * Copyright (C) 2026. GPLv2 or later.
  */
@@ -44,7 +46,7 @@
 #define MANCHESTER_ONE_IS_10 1
 
 // Device ID cloned from captures (frame bytes 13..15).
-static const uint8_t DEV_ID[3] = {0x34, 0x9E, 0x48};
+static const uint8_t DEV_ID[3] = {0x34, 0x9E, 0x67};
 
 // Mode byte (frame byte 12). bit1 = heat(1)/cool(0), bit0 = pairing.
 // 0x02 = heat, normal operation, not pairing.
@@ -328,6 +330,39 @@ static void setupRoutes() {
         snprintf(resp, sizeof(resp),
                  "sent ABA: amb=%.1f sp=%.1f cfh=0x%02x mode=0x%02x",
                  amb, sp, cfh, mode);
+        Serial.println(resp);
+        req->send(200, "text/plain", resp);
+    });
+
+    // Send pairing frames at ~2 Hz for `duration` seconds (default 30, max 120).
+    // Byte 12 has bit 0 set (pairing) plus the heat/cool bit from `mode`.
+    // Blocks until done; the response is sent only after all frames are sent.
+    server.on("/tx-pair", HTTP_GET, [](AsyncWebServerRequest *req) {
+        int     duration  = 30;
+        float   amb = 0.0f, sp = 0.0f;
+        uint8_t mode_base = 0x02;   // heat by default
+
+        if (req->hasParam("duration")) {
+            int v = req->getParam("duration")->value().toInt();
+            if (v >= 1 && v <= 120) duration = v;
+        }
+        if (req->hasParam("mode")) {
+            String m = req->getParam("mode")->value();
+            mode_base = m.equalsIgnoreCase("cool") ? 0x00 : 0x02;
+        }
+        if (req->hasParam("amb")) amb = req->getParam("amb")->value().toFloat();
+        if (req->hasParam("sp"))  sp  = req->getParam("sp")->value().toFloat();
+
+        uint8_t pair_mode = mode_base | 0x01;   // set pairing bit
+        int frames = duration * 2;
+        for (int i = 0; i < frames; i++) {
+            sendFrameOnce(amb, sp, 0x00, pair_mode);
+            delay(500);
+        }
+
+        char resp[80];
+        snprintf(resp, sizeof(resp),
+                 "pairing done: %d frames, mode=0x%02x", frames, pair_mode);
         Serial.println(resp);
         req->send(200, "text/plain", resp);
     });
