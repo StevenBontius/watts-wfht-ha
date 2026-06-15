@@ -92,6 +92,24 @@ static const uint8_t MODE_HEAT_NORMAL = 0x02;
 static AsyncWebServer server(80);
 
 // ---------------------------------------------------------------------------
+// Pairing state. The pairing stream lasts up to 120 s, far too long to run
+// inside an AsyncWebServer callback (that blocks the AsyncTCP task and trips
+// the task watchdog, rebooting the ESP mid-burst). Instead the handler arms
+// this state and returns immediately; loop() emits one frame per `gap_ms`.
+// ---------------------------------------------------------------------------
+struct PairJob {
+    bool     active   = false;
+    int      sent     = 0;       // frames sent so far
+    int      total    = 0;       // frames to send
+    uint32_t gap_ms   = 500;
+    uint32_t next_at  = 0;       // millis() of next frame
+    float    amb      = 0.0f;
+    float    sp        = 0.0f;
+    uint8_t  mode     = 0x03;    // heat + pairing
+};
+static PairJob pairJob;
+
+// ---------------------------------------------------------------------------
 // CRC algorithms, matched bit-for-bit to the rtl-433 decoder
 // ---------------------------------------------------------------------------
 
@@ -233,14 +251,17 @@ static void sendFrameOnce(float amb, float sp, uint8_t cfh, uint8_t mode) {
     cc1101SendRaw(chips, sizeof(chips));
 }
 
-// Setpoint-change A-B-A burst. B carries setpoint + 0.1 C; consumers treat the
-// lower of the pair as the real value.
-static void sendABA(float amb, float sp, uint8_t cfh, uint8_t mode) {
-    sendFrameOnce(amb, sp,        cfh, mode);                   // A
-    delay(400);
-    sendFrameOnce(amb, sp + 0.1f, cfh, mode);                  // B
-    delay(400);
-    sendFrameOnce(amb, sp,        cfh, mode);                   // A
+// Emit `count` frames `gap_ms` apart, alternating sp (A) / sp+0.1 (B):
+// A, B, A, B, ...  The +0.1 B-frame is the LSB-offset twin; consumers treat the
+// lower of a pair as the real setpoint. This is the single transmit path:
+//   normal state change -> count=3, gap=400 (A-B-A)
+//   pairing             -> count=duration*2, gap=500 (2 Hz A-B-A-B-... stream)
+static void sendBurst(float amb, float sp, uint8_t cfh, uint8_t mode,
+                      int count, uint32_t gap_ms) {
+    for (int i = 0; i < count; i++) {
+        sendFrameOnce(amb, (i & 1) ? sp + 0.1f : sp, cfh, mode);
+        if (i < count - 1) delay(gap_ms);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +345,7 @@ static void setupRoutes() {
             mode = m.equalsIgnoreCase("cool") ? 0x00 : 0x02;
         }
 
-        sendABA(amb, sp, cfh, mode);
+        sendBurst(amb, sp, cfh, mode, 3, 400);   // A-B-A
 
         char resp[96];
         snprintf(resp, sizeof(resp),
@@ -334,11 +355,11 @@ static void setupRoutes() {
         req->send(200, "text/plain", resp);
     });
 
-    // Send pairing frames at ~2 Hz for `duration` seconds (default 30, max 120).
+    // Send pairing frames at ~2 Hz for `duration` seconds (default 10, max 120).
     // Byte 12 has bit 0 set (pairing) plus the heat/cool bit from `mode`.
     // Blocks until done; the response is sent only after all frames are sent.
     server.on("/tx-pair", HTTP_GET, [](AsyncWebServerRequest *req) {
-        int     duration  = 30;
+        int     duration  = 10;
         float   amb = 0.0f, sp = 0.0f;
         uint8_t mode_base = 0x02;   // heat by default
 
@@ -354,15 +375,23 @@ static void setupRoutes() {
         if (req->hasParam("sp"))  sp  = req->getParam("sp")->value().toFloat();
 
         uint8_t pair_mode = mode_base | 0x01;   // set pairing bit
-        int frames = duration * 2;
-        for (int i = 0; i < frames; i++) {
-            sendFrameOnce(amb, sp, 0x00, pair_mode);
-            delay(500);
-        }
+        int frames = duration * 2;              // 2 Hz for `duration` seconds
 
-        char resp[80];
+        // Arm the job; loop() does the actual ~30 s of transmitting so we never
+        // block the AsyncTCP task. Respond right away.
+        pairJob.active  = true;
+        pairJob.sent    = 0;
+        pairJob.total   = frames;
+        pairJob.gap_ms  = 500;
+        pairJob.next_at = millis();
+        pairJob.amb     = amb;
+        pairJob.sp      = sp;
+        pairJob.mode    = pair_mode;
+
+        char resp[96];
         snprintf(resp, sizeof(resp),
-                 "pairing done: %d frames, mode=0x%02x", frames, pair_mode);
+                 "pairing started: %d frames over %ds, mode=0x%02x",
+                 frames, duration, pair_mode);
         Serial.println(resp);
         req->send(200, "text/plain", resp);
     });
@@ -391,5 +420,18 @@ void setup() {
 }
 
 void loop() {
-    // main control loop goes here
+    // Non-blocking pairing stream: one A/B frame every gap_ms, alternating
+    // sp (A) / sp+0.1 (B), until `total` frames have gone out.
+    if (pairJob.active && (int32_t)(millis() - pairJob.next_at) >= 0) {
+        bool isB = pairJob.sent & 1;
+        sendFrameOnce(pairJob.amb, isB ? pairJob.sp + 0.1f : pairJob.sp,
+                      0x00, pairJob.mode);
+        pairJob.sent++;
+        if (pairJob.sent >= pairJob.total) {
+            pairJob.active = false;
+            Serial.printf("pairing done: %d frames sent\n", pairJob.sent);
+        } else {
+            pairJob.next_at = millis() + pairJob.gap_ms;
+        }
+    }
 }
