@@ -1,0 +1,76 @@
+# Implementation roadmap
+
+Tracks the path from the current HTTP-driven TX proof-of-concept to the headless
+multi-zone Home Assistant bridge described in the README.
+
+**Runtime model:** standalone Arduino / PlatformIO firmware (`firmware/`). The ESP
+owns WiFi, MQTT, the control loop, the device registry (NVS) and HA discovery
+itself — there is no ESPHome layer. (Earlier docs said ESPHome; that was dropped.)
+
+Status legend: `[x]` done · `[ ]` open · `[~]` partial.
+
+---
+
+## M0 — RF proof of concept ✅ (done)
+
+- [x] Protocol characterization + forked rtl_433 decoder (`docs/WATTS_WFHT_RF_PROTOCOL.md`)
+- [x] Control model validated in Python (`tools/wfht_emulator.py`)
+- [x] Frame build + custom CRC-8 + radio CRC-16 in firmware
+- [x] Software Manchester encoder + raw OOK transmit (CC1101 hw Manchester/CRC/whitening off)
+- [x] A-B-A burst with the +0.1 °C B-frame twin
+- [x] HTTP control surface: `/status`, `/tx-test`, `/tx-watts`, `/tx-pair`
+- [x] Non-blocking pairing stream in `loop()` (2 Hz, watchdog-safe)
+
+## M1 — Single-zone live bridge (smallest thing that heats a real floor from HA)
+
+Goal: spoof one captured device ID, driven by HA over MQTT, with on-device control
+and failsafes — no HTTP, no RX, no multi-zone yet.
+
+- [ ] **MQTT client** — wire up the already-bundled `AsyncMqttClient`: connect, reconnect, LWT
+- [ ] **Subscribe** to ambient + setpoint topics (hard-coded single zone for now)
+- [ ] **Port the P-loop to firmware** — `duty = clip((SP - T)/Bp, 0, 1)` plus the
+      anti-short-cycle clamps and demand-onset / SP-drop exceptions from the emulator
+- [ ] **Steady-state scheduler** — retransmit every 154 s in `loop()`, and fire
+      immediately on a state change (setpoint or call-for-heat flip)
+- [ ] **Map duty → call-for-heat flag** (0x00 / 0x64) on the cycle boundary
+- [ ] **Stale-data failsafe** — if no valid MQTT update within the safety window
+      (≈60 min), force idle (0x00) until data resumes
+- [ ] **Publish state** back to MQTT (current cfh, duty, last-tx age) for observability
+- [ ] **Retire / gate the HTTP test endpoints** behind a debug build flag
+- [ ] Field test against the real Watts receiver (one zone)
+
+## M2 — RX path + pairing capture
+
+Goal: the radio can receive, so new device IDs can be registered by switching a
+thermostat off.
+
+- [ ] **CC1101 receive config** + GDO interrupt / FIFO read
+- [ ] **Software Manchester decode** of received frames (mirror the encoder)
+- [ ] **Validate** sync word + both CRCs on RX
+- [ ] **Off-frame detector** — setpoint 0.0 + `FF FF FE` shape → capture device ID (bytes 13..15)
+- [ ] **Pairing-capture flow** — arm "listen for off-frame", surface the captured ID
+- [ ] (Optional) sniff/log real thermostat frames for cross-checking
+
+## M3 — Multi-zone + device registry
+
+Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
+
+- [ ] **NVS device registry** — per channel: name, device ID, source topic, field map
+- [ ] **Per-zone control loop instances** (5 zones: 4 up + 1 down)
+- [ ] **Z2M discovery** — subscribe to retained `zigbee2mqtt/bridge/devices`, filter
+      thermostat-capable devices, read `exposes` for topic + field names
+- [ ] **Binding workflow** — associate a captured Watts channel with a discovered Z2M thermostat
+- [ ] **Pair a new virtual device ID** to replace the broken thermostat
+
+## M4 — Home Assistant UX (headless)
+
+- [ ] **Per-zone parental lock** toggle — gate W100 local button input on/off
+- [ ] **MQTT discovery entities** — expose status + lock per zone without cluttering
+      the climate dashboard
+- [ ] Document the HA/MQTT topic contract
+
+## Post-MVP (deferred, design only)
+
+- [ ] Cooling + dewpoint safety + downstairs humidity contact (`docs/safety/cooling-and-dewpoint.md` — not yet written)
+- [ ] Downstairs zone subdivision
+- [ ] Upstream protocol findings to mainline rtl_433

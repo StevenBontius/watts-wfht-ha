@@ -35,7 +35,7 @@ Aqara W100 (temp + humidity + up/down/scene buttons)
         ▼
    MQTT Broker
         │
-        ▼  (Subscribed by ESPHome Custom Component)
+        ▼  (Subscribed by standalone ESP32 firmware)
    ESP32 (Edge Intelligence Layer)
         │     - Runs local PI control loop (Bp=2.0°C, Cy=900s, On/Of=120s)
         │     - Calculates active duty fraction and target call-for-heat flag (0x64 or 0x00)

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-This is a reverse-engineering and firmware project to replace Watts WFHT-RF legacy underfloor heating thermostats with a headless Home Assistant bridge (ESP32 + CC1101). Phase 1 (RF protocol characterization) is complete. The next phase is ESPHome firmware implementing the bridge.
+This is a reverse-engineering and firmware project to replace Watts WFHT-RF legacy underfloor heating thermostats with a headless Home Assistant bridge (ESP32 + CC1101). Phase 1 (RF protocol characterization) is complete. The firmware is a **standalone Arduino / PlatformIO app** (`firmware/`) — not ESPHome; the ESP owns WiFi, MQTT, the control loop, the NVS device registry and HA discovery itself. Today it is an HTTP-driven TX proof of concept; the path to the full bridge is tracked in `docs/ROADMAP.md`.
 
 ## Running the emulator
 
@@ -21,6 +21,20 @@ rtl_433 -f 433.92M -X 'n=Watts_MC,m=OOK_MC_ZEROBIT,s=460,l=0,r=900' -F json
 ```
 
 The forked rtl_433 decoder (`StevenBontius/rtl_433`) handles CRC validation and A-B-A burst parsing natively.
+
+## Building the firmware
+
+```bash
+cd firmware
+cp include/config.example.h include/config.h   # fill in WiFi creds + CC1101 pins
+pio run -t upload          # build + flash ESP32 over USB
+pio device monitor         # serial @ 115200
+```
+
+Current firmware is an HTTP-driven TX proof of concept (single hard-coded device
+ID, no MQTT, no RX). Control surface: `GET /status`, `/tx-test`, `/tx-watts`,
+`/tx-pair`. `MANCHESTER_ONE_IS_10` in `src/main.cpp` is the one physical-layer
+polarity knob — flip it if rtl_433 is silent or reports bit-inverted CRC failures.
 
 ## Architecture
 
@@ -39,7 +53,7 @@ The system has two layers:
 - User SP change driving error negative cuts the active ON pulse immediately (bypasses `On_min`)
 
 **Planned runtime stack:**
-- Aqara W100 → Zigbee2MQTT → Home Assistant → MQTT broker → ESP32 (ESPHome custom component) → CC1101 → Watts central receiver → manifold servo valves
+- Aqara W100 → Zigbee2MQTT → Home Assistant → MQTT broker → ESP32 (standalone Arduino/PlatformIO firmware) → CC1101 → Watts central receiver → manifold servo valves
 
 ## Key invariants
 
