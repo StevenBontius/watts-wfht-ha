@@ -27,12 +27,12 @@ Goal: spoof one captured device ID, driven by HA over MQTT, with on-device contr
 and failsafes — no HTTP, no RX, no multi-zone yet.
 
 - [ ] **MQTT client** — wire up the already-bundled `AsyncMqttClient`: connect, reconnect, LWT
-- [ ] **Characterize Z2M output for the W100** — subscribe to `zigbee2mqtt/<device>`,
-      capture the retained JSON payload, document the topic + exact field names
-      (local_temperature, setpoint field, button/scene events). Concrete reference
-      case; M1 hard-codes against it, M3 generalizes it via discovery.
-- [ ] **Subscribe** to the W100's ambient + setpoint fields (single zone, hard-coded
-      against the characterized payload above — a stepping stone, generalized in M3)
+- [x] **Characterize Z2M output for the W100** — field reference documented in
+      `docs/MQTT_W100.md` from the Z2M device definition (model TH-S04D):
+      `temperature` → T, `occupied_heating_setpoint` → SP, `system_mode` → heat/cool/off.
+      Concrete reference case; M1 hard-codes against it, M3 generalizes it via discovery.
+- [ ] **Subscribe** to the W100's `temperature` + `occupied_heating_setpoint`
+      (single zone, hard-coded against `docs/MQTT_W100.md` — a stepping stone, generalized in M3)
 - [ ] **Port the P-loop to firmware** — `duty = clip((SP - T)/Bp, 0, 1)` plus the
       anti-short-cycle clamps and demand-onset / SP-drop exceptions from the emulator
 - [ ] **Steady-state scheduler** — retransmit every 154 s in `loop()`, and fire
