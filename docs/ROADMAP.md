@@ -69,6 +69,35 @@ Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
       the climate dashboard
 - [ ] Document the HA/MQTT topic contract
 
+## Testing & validation (cross-cutting)
+
+How each layer is checked. The current and primary method is end-to-end against
+real hardware, which is strong evidence — these items are about catching *future*
+regressions and the failure modes that hardware testing doesn't exercise.
+
+**Current method (works, keep using):**
+- [x] Frame/CRC correctness — forked rtl_433 decodes TX frames byte-for-byte
+      alongside the real thermostats; actuates the real Watts receiver
+- [x] Control model — Python emulator validated against an overnight capture (`tools/wfht_emulator.py`)
+
+**Per-milestone validation to add:**
+- [ ] **M1** — field test one zone against the real receiver (already listed in M1)
+- [ ] **M1** — failsafe test: stall MQTT updates, confirm the stale-data timeout
+      forces idle (0x00) — a path hardware "happy path" testing never hits
+- [ ] **M1** — MQTT resilience: kill/restart the broker and WiFi, confirm reconnect
+      and that the loop keeps running on last-known values
+- [ ] **M2** — RX loopback: encode → decode roundtrip in firmware; assert recovered
+      bytes + CRCs match the source frame
+- [ ] **M3** — registry persistence: write channels to NVS, reboot, confirm they reload
+- [ ] **M3** — multi-zone isolation: confirm a per-channel device ID change doesn't
+      corrupt other zones' frames (the refactor most likely to silently break CRCs)
+
+**Optional (deferred — manual hardware loop deemed sufficient for now):**
+- [ ] Host-side unit tests (`pio test -e native`) for the pure functions
+      (`buildFrame`, `crc8_raw`, `crc16_cms`, `manchesterEncode`) asserting against
+      known-good captured frames. Cheap regression tripwire; revisit if a silent
+      frame/CRC regression ever bites, or before the M3 multi-zone refactor.
+
 ## Post-MVP (deferred, design only)
 
 - [ ] Cooling + dewpoint safety + downstairs humidity contact (`docs/safety/cooling-and-dewpoint.md` — not yet written)
