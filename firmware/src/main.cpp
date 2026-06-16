@@ -25,6 +25,40 @@
  * Copyright (C) 2026. GPLv2 or later.
  */
 
+// ---------------------------------------------------------------------------
+// PLANNED ARCHITECTURE (design notes, not yet implemented)
+// ---------------------------------------------------------------------------
+// The bridge is a transcoder, not a controller-of-record: it reads ambient +
+// setpoint from an HA thermostat over MQTT, runs the P-loop locally to derive
+// call-for-heat, and transmits a Watts frame. HA needs zero configuration; the
+// ESP owns the device registry (NVS) and all coupling.
+//
+// Pairing has two independent halves, joined on the ESP:
+//
+//   1. Watts RF side (needs an RX path, TX-only today). To pair a thermostat
+//      the user switches it OFF; this transmits setpoint 0.0 packets, which are
+//      rare in normal operation. The ESP listens for an off-frame, validates it
+//      (CRC + FF FF FE shape), captures the device ID (frame bytes 13..15) and
+//      registers it. The user then names that channel (e.g. "livingroom").
+//      The deliberate switch-off is what ties an ID to a room.
+//
+//   2. HA side. Subscribe to Zigbee2MQTT's retained `zigbee2mqtt/bridge/devices`
+//      inventory, filter for thermostat-capable devices, present a dropdown.
+//      The `exposes` metadata gives the source topic + field names
+//      (local_temperature / occupied_heating_setpoint) automatically -- nothing
+//      to type.
+//
+// Binding = pair a Watts channel (device ID) with a discovered Z2M thermostat,
+// stored on the ESP. Per channel: name, device ID, source topic, field map.
+//
+// CAVEAT: HA-thermostat discovery is Zigbee2MQTT-specific -- it reads the Z2M
+// bridge topic, not a generic HA mechanism. Correct for this stack (W100 -> Z2M).
+// Supporting non-Zigbee HA thermostats would need a second source
+// (`homeassistant/climate/#` discovery configs), and even then only
+// MQTT-published climate entities would appear -- HA-internal ones (e.g.
+// generic_thermostat) would not. Not built; speculative.
+// ---------------------------------------------------------------------------
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <AsyncTCP.h>
