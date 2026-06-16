@@ -15,7 +15,7 @@ published Z2M device definition — no live capture needed.
 | Ambient `T` (control input) | `temperature` | numeric, °C | `local_temperature` carries the same value; use `temperature`. |
 | Setpoint `SP` (control input) | `occupied_heating_setpoint` | numeric, 5–30 °C, **settable** | HA schedules/automations can write this too. |
 | Heat/cool mode (Watts byte 12 bit) | `system_mode` | enum: `off`/`heat`/`cool`/`auto` | `heat` → 0x02, `cool` → 0x00. |
-| Enrollment / failsafe trigger | `system_mode: off` | enum value | The deliberate switch-off; see M2 RX enrollment in `ROADMAP.md`. |
+| Enrollment / failsafe trigger | `system_mode: off` | enum value | The deliberate switch-off |
 
 ## Deliberately ignored
 
@@ -30,8 +30,4 @@ published Z2M device definition — no live capture needed.
 
 ## Notes
 
-- `temperature` and `local_temperature` are identical on this device — pick one
-  (`temperature`) and stay consistent.
-- `system_mode: off` is the single value that drives both the M2 RX enrollment
-  gesture (switch a real thermostat off → capture its device ID) and the
-  stale-data failsafe intent (force idle).
+- `temperature` and `local_temperature` are identical on this device
