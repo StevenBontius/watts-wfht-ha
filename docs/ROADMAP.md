@@ -27,7 +27,12 @@ Goal: spoof one captured device ID, driven by HA over MQTT, with on-device contr
 and failsafes — no HTTP, no RX, no multi-zone yet.
 
 - [ ] **MQTT client** — wire up the already-bundled `AsyncMqttClient`: connect, reconnect, LWT
-- [ ] **Subscribe** to ambient + setpoint topics (hard-coded single zone for now)
+- [ ] **Characterize Z2M output for the W100** — subscribe to `zigbee2mqtt/<device>`,
+      capture the retained JSON payload, document the topic + exact field names
+      (local_temperature, setpoint field, button/scene events). Concrete reference
+      case; M1 hard-codes against it, M3 generalizes it via discovery.
+- [ ] **Subscribe** to the W100's ambient + setpoint fields (single zone, hard-coded
+      against the characterized payload above — a stepping stone, generalized in M3)
 - [ ] **Port the P-loop to firmware** — `duty = clip((SP - T)/Bp, 0, 1)` plus the
       anti-short-cycle clamps and demand-onset / SP-drop exceptions from the emulator
 - [ ] **Steady-state scheduler** — retransmit every 154 s in `loop()`, and fire
@@ -58,7 +63,9 @@ Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 - [ ] **NVS device registry** — per channel: name, device ID, source topic, field map
 - [ ] **Per-zone control loop instances** (5 zones: 4 up + 1 down)
 - [ ] **Z2M discovery** — subscribe to retained `zigbee2mqtt/bridge/devices`, filter
-      thermostat-capable devices, read `exposes` for topic + field names
+      thermostat-capable devices, read `exposes` for topic + field names. Generalizes
+      the manual M1 W100 characterization so the bridge stays zero-config for users
+      with arbitrary (non-W100) thermostats.
 - [ ] **Binding workflow** — associate a captured Watts channel with a discovered Z2M thermostat
 - [ ] **Pair a new virtual device ID** to replace the broken thermostat
 
