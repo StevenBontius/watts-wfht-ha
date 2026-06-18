@@ -147,6 +147,12 @@ struct Thermostat {
     char tempField[32];   // e.g. local_temperature
     char spField[32];     // e.g. occupied_heating_setpoint
     char modeField[32];   // e.g. system_mode (off/heat/cool/auto), "" if none
+    // Latest cached values (NAN / "" until the first state message). Z2M
+    // republishes the full state on every attribute report (incl. ones we
+    // ignore, like humidity), so we cache and only act/log on real changes.
+    float lastTemp;
+    float lastSp;
+    char  lastMode[32];
 };
 static const int MAX_THERMOSTATS = 8;
 static Thermostat thermostats[MAX_THERMOSTATS];
@@ -424,6 +430,9 @@ static void parseZ2MDevices(const char *json, size_t len) {
                 strlcpy(t.spField, spProp ? spProp : "occupied_heating_setpoint",
                         sizeof(t.spField));
                 strlcpy(t.modeField, modeProp ? modeProp : "", sizeof(t.modeField));
+                t.lastTemp = NAN;
+                t.lastSp   = NAN;
+                t.lastMode[0] = '\0';
                 char stateTopic[64];
                 snprintf(stateTopic, sizeof(stateTopic), "zigbee2mqtt/%s", name);
                 uint16_t pid = mqtt.subscribe(stateTopic, 0);
@@ -456,12 +465,26 @@ static void handleStateMessage(const char *topic, const char *payload, size_t le
     float temp = doc[t->tempField] | NAN;
     float sp   = doc[t->spField]   | NAN;
     // system_mode is a string enum (off/heat/cool/auto), not a number.
-    const char *mode = t->modeField[0] ? (doc[t->modeField] | "--") : "n/a";
+    const char *mode = t->modeField[0] ? (doc[t->modeField] | "") : "";
+
+    // Update the cache, tracking whether anything we care about actually moved.
+    // NaN means the field was absent from this (partial) update -- keep the old
+    // value. Comparisons against the NaN sentinel are always true, so the first
+    // real reading counts as a change.
+    bool changed = false;
+    if (!isnan(temp) && temp != t->lastTemp) { t->lastTemp = temp; changed = true; }
+    if (!isnan(sp)   && sp   != t->lastSp)   { t->lastSp   = sp;   changed = true; }
+    if (mode[0] && strcmp(mode, t->lastMode) != 0) {
+        strlcpy(t->lastMode, mode, sizeof(t->lastMode));
+        changed = true;
+    }
+    if (!changed) return;   // redundant republish (e.g. humidity-only) -- ignore
+
     char tbuf[8], sbuf[8];
-    if (isnan(temp)) strcpy(tbuf, "--"); else snprintf(tbuf, sizeof(tbuf), "%.1f", temp);
-    if (isnan(sp))   strcpy(sbuf, "--"); else snprintf(sbuf, sizeof(sbuf), "%.1f", sp);
+    if (isnan(t->lastTemp)) strcpy(tbuf, "--"); else snprintf(tbuf, sizeof(tbuf), "%.1f", t->lastTemp);
+    if (isnan(t->lastSp))   strcpy(sbuf, "--"); else snprintf(sbuf, sizeof(sbuf), "%.1f", t->lastSp);
     Serial.printf("Z2M state %s: temp=%s setpoint=%s mode=%s\n",
-                  t->name, tbuf, sbuf, mode);
+                  t->name, tbuf, sbuf, t->modeField[0] ? t->lastMode : "n/a");
 }
 
 // AsyncMqttClient message callback. Large retained payloads arrive in fragments
