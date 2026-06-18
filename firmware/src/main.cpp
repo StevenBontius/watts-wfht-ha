@@ -123,9 +123,41 @@ static const uint8_t MODE_HEAT_NORMAL = 0x02;
 #ifndef CC1101_STX
 #define CC1101_STX 0x35
 #endif
+#ifndef CC1101_SRX
+#define CC1101_SRX 0x34
+#endif
+#ifndef CC1101_IOCFG0
+#define CC1101_IOCFG0 0x02
+#endif
 
 static AsyncWebServer server(80);
 static AsyncMqttClient mqtt;
+
+// ---------------------------------------------------------------------------
+// RX raw-capture (Step 1: prove we hear the thermostats).
+//
+// CC1101 in async-serial OOK mode pushes the demodulated envelope out on GDO0;
+// we time the edges with a pin interrupt and dump per-burst pulse-width
+// summaries. No Manchester decode yet -- this is just to confirm reception and
+// eyeball the bimodal ~420 us (1 chip) / ~840 us (2 chip) timing. Toggled over
+// HTTP (/rx-on, /rx-off) so it doesn't disturb the TX path.
+// ---------------------------------------------------------------------------
+static const uint16_t PULSE_BUF = 512;
+static volatile uint16_t pulseBuf[PULSE_BUF];
+static volatile uint16_t pulseHead = 0, pulseTail = 0;
+static volatile uint32_t lastEdgeUs = 0;
+static bool rxActive = false;
+
+static void IRAM_ATTR gdo0Isr() {
+    uint32_t now = micros();
+    uint32_t d   = now - lastEdgeUs;   // unsigned, wraps cleanly
+    lastEdgeUs   = now;
+    uint16_t next = (uint16_t)((pulseHead + 1) % PULSE_BUF);
+    if (next != pulseTail) {           // drop on overflow rather than block
+        pulseBuf[pulseHead] = (d > 65535) ? 65535 : (uint16_t)d;
+        pulseHead = next;
+    }
+}
 
 // Reconnect bookkeeping. AsyncMqttClient is event-driven and never blocks; on a
 // drop we just re-arm a one-shot retry that loop() fires.
@@ -372,6 +404,38 @@ static bool initCC1101() {
 }
 
 // ---------------------------------------------------------------------------
+// RX mode control
+// ---------------------------------------------------------------------------
+static void rxEnable() {
+    ELECHOUSE_cc1101.SpiStrobe(CC1101_SIDLE);
+    // GDO0 -> asynchronous serial data output (raw demodulated OOK envelope).
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_IOCFG0, 0x0D);
+    // PKTCTRL0 = 0x30: asynchronous serial mode, no CRC, no whitening.
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_PKTCTRL0, 0x30);
+    // MDMCFG4 = 0x86: RX channel BW ~203 kHz (covers the ~+73 kHz device
+    // offset), keep DRATE_E=6 to match the TX chip rate.
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_MDMCFG4, 0x86);
+
+    pulseHead = pulseTail = 0;
+    lastEdgeUs = micros();
+    pinMode(PIN_GDO0, INPUT);
+    attachInterrupt(digitalPinToInterrupt(PIN_GDO0), gdo0Isr, CHANGE);
+    ELECHOUSE_cc1101.SpiStrobe(CC1101_SRX);
+    rxActive = true;
+    Serial.println("RX: listening (async OOK, raw pulse dump)");
+}
+
+static void rxDisable() {
+    detachInterrupt(digitalPinToInterrupt(PIN_GDO0));
+    ELECHOUSE_cc1101.SpiStrobe(CC1101_SIDLE);
+    // Restore the TX-capable packet config (FIFO, fixed length, no CRC).
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_PKTCTRL0, 0x00);
+    ELECHOUSE_cc1101.SpiWriteReg(CC1101_IOCFG0, 0x2E);   // GDO0 high-impedance
+    rxActive = false;
+    Serial.println("RX: stopped");
+}
+
+// ---------------------------------------------------------------------------
 // Zigbee2MQTT inventory parsing -> thermostat discovery
 // ---------------------------------------------------------------------------
 // The inventory is a JSON array of device objects. A thermostat-capable device
@@ -555,9 +619,20 @@ static void setupRoutes() {
         doc["ip"]   = WiFi.localIP().toString();
         doc["rssi"] = WiFi.RSSI();
         doc["manchester_one_is_10"] = (int)MANCHESTER_ONE_IS_10;
+        doc["rx_active"] = rxActive;
         String body;
         serializeJson(doc, body);
         req->send(200, "application/json", body);
+    });
+
+    // RX raw capture on/off (Step 1 listening test).
+    server.on("/rx-on", HTTP_GET, [](AsyncWebServerRequest *req) {
+        rxEnable();
+        req->send(200, "text/plain", "rx on -- watch serial for pulse bursts");
+    });
+    server.on("/rx-off", HTTP_GET, [](AsyncWebServerRequest *req) {
+        rxDisable();
+        req->send(200, "text/plain", "rx off");
     });
 
     // Raw lead-in burst, a quick "is the PA keying" smoke test.
@@ -671,6 +746,30 @@ void loop() {
             mqtt.connect();
         } else {
             mqttRetryAt = millis() + 5000;   // wait for WiFi to come back
+        }
+    }
+
+    // RX raw capture: drain timed edges, group into bursts on a long idle gap,
+    // and print a per-burst summary. A genuine frame is ~100-300 pulses of
+    // ~420/840 us; a >=1500 us gap delimits frames. MIN_PULSES filters noise.
+    if (rxActive) {
+        static uint16_t acc = 0;          // pulses in the current burst
+        static uint16_t sample[32];       // first few widths, for eyeballing
+        static uint16_t sampN = 0;
+        while (pulseTail != pulseHead) {
+            uint16_t w = pulseBuf[pulseTail];
+            pulseTail = (uint16_t)((pulseTail + 1) % PULSE_BUF);
+            if (w >= 1500) {              // inter-frame / idle gap -> flush
+                if (acc >= 40) {
+                    Serial.printf("RX burst: %u pulses; first widths(us):", acc);
+                    for (uint16_t i = 0; i < sampN; i++) Serial.printf(" %u", sample[i]);
+                    Serial.println();
+                }
+                acc = 0; sampN = 0;
+            } else {
+                if (sampN < 32) sample[sampN++] = w;
+                acc++;
+            }
         }
     }
 
