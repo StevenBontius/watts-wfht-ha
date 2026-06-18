@@ -65,6 +65,7 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include <AsyncMqttClient.h>
 #include <math.h>
 #include <string.h>
 #include "config.h"
@@ -124,6 +125,19 @@ static const uint8_t MODE_HEAT_NORMAL = 0x02;
 #endif
 
 static AsyncWebServer server(80);
+static AsyncMqttClient mqtt;
+
+// Reconnect bookkeeping. AsyncMqttClient is event-driven and never blocks; on a
+// drop we just re-arm a one-shot retry that loop() fires.
+static uint32_t mqttRetryAt = 0;   // millis() of next connect attempt, 0 = idle
+
+// Zigbee2MQTT auto-discovery. The broker pushes this retained inventory the
+// instant we subscribe; we parse it for thermostat-capable devices. The payload
+// is large and AsyncMqttClient delivers it in fragments, so we reassemble it in
+// a heap buffer keyed by `index` before parsing.
+static const char *Z2M_DEVICES_TOPIC = "zigbee2mqtt/bridge/devices";
+static char  *z2mBuf   = nullptr;   // reassembly buffer, malloc'd per message
+static size_t z2mTotal = 0;         // expected full payload length
 
 // ---------------------------------------------------------------------------
 // Pairing state. The pairing stream lasts up to 120 s, far too long to run
@@ -339,6 +353,112 @@ static bool initCC1101() {
 }
 
 // ---------------------------------------------------------------------------
+// Zigbee2MQTT inventory parsing -> thermostat discovery
+// ---------------------------------------------------------------------------
+// The inventory is a JSON array of device objects. A thermostat-capable device
+// has, in definition.exposes, an entry of type "climate" whose nested features
+// include local_temperature (current temp) and occupied_heating_setpoint. We use
+// an ArduinoJson filter so only the fields we need survive deserialization --
+// the raw inventory is far too big to hold whole on an ESP32.
+static void parseZ2MDevices(const char *json, size_t len) {
+    JsonDocument filter;
+    filter[0]["friendly_name"]          = true;
+    filter[0]["ieee_address"]           = true;
+    filter[0]["definition"]["exposes"]  = true;
+
+    JsonDocument doc;
+    DeserializationError err =
+        deserializeJson(doc, json, len, DeserializationOption::Filter(filter));
+    if (err) {
+        Serial.printf("Z2M: inventory parse error: %s\n", err.c_str());
+        return;
+    }
+
+    JsonArray devices = doc.as<JsonArray>();
+    Serial.printf("Z2M: inventory received (%u devices)\n", devices.size());
+
+    int found = 0;
+    for (JsonObject dev : devices) {
+        // definition is null for the coordinator; exposes iterates as empty then.
+        for (JsonObject ex : dev["definition"]["exposes"].as<JsonArray>()) {
+            const char *type = ex["type"] | "";
+            if (strcmp(type, "climate") != 0) continue;
+
+            const char *name = dev["friendly_name"] | "?";
+            const char *ieee = dev["ieee_address"]  | "?";
+            const char *tempProp = nullptr, *spProp = nullptr;
+            for (JsonObject feat : ex["features"].as<JsonArray>()) {
+                const char *prop = feat["property"] | "";
+                if (strcmp(prop, "local_temperature") == 0)      tempProp = prop;
+                else if (strstr(prop, "setpoint") != nullptr)    spProp   = prop;
+            }
+
+            found++;
+            Serial.printf("Z2M thermostat: \"%s\" [%s]\n", name, ieee);
+            Serial.printf("  state topic:    zigbee2mqtt/%s\n", name);
+            Serial.printf("  temp field:     %s\n", tempProp ? tempProp : "(none)");
+            Serial.printf("  setpoint field: %s\n", spProp   ? spProp   : "(none)");
+            break;   // one climate expose per device is enough
+        }
+    }
+    if (found == 0)
+        Serial.println("Z2M: no thermostat-capable devices in inventory");
+}
+
+// AsyncMqttClient message callback. Large retained payloads arrive in fragments
+// (index..index+len of total); reassemble before parsing.
+static void onMqttMessage(char *topic, char *payload,
+                          AsyncMqttClientMessageProperties props,
+                          size_t len, size_t index, size_t total) {
+    if (strcmp(topic, Z2M_DEVICES_TOPIC) != 0) return;
+
+    if (index == 0) {                 // first fragment: (re)alloc the buffer
+        free(z2mBuf);
+        z2mBuf   = (char *)malloc(total + 1);
+        z2mTotal = total;
+    }
+    if (!z2mBuf || index + len > z2mTotal) return;   // OOM or stray fragment
+
+    memcpy(z2mBuf + index, payload, len);
+    if (index + len < total) return;                 // more fragments coming
+
+    z2mBuf[total] = '\0';
+    parseZ2MDevices(z2mBuf, total);
+    free(z2mBuf);
+    z2mBuf   = nullptr;
+    z2mTotal = 0;
+}
+
+// ---------------------------------------------------------------------------
+// MQTT init (connect + subscribe to the Z2M inventory for discovery)
+// ---------------------------------------------------------------------------
+// AsyncMqttClient is non-blocking: connect() returns immediately and the result
+// arrives on a callback. We report over Serial in the same shape as the CC1101
+// init ("MQTT: ..."). On a disconnect we arm a one-shot retry in loop().
+static void initMqtt() {
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    mqtt.setClientId(MQTT_CLIENT_ID);
+    if (strlen(MQTT_USER) > 0)
+        mqtt.setCredentials(MQTT_USER, MQTT_PASSWORD);
+
+    mqtt.onConnect([](bool sessionPresent) {
+        Serial.printf("MQTT: connected to %s:%d\n", MQTT_HOST, MQTT_PORT);
+        mqttRetryAt = 0;
+        // Subscribe to the retained Z2M inventory; the broker delivers it at once.
+        uint16_t pid = mqtt.subscribe(Z2M_DEVICES_TOPIC, 0);
+        Serial.printf("MQTT: subscribed to %s (pid %u)\n", Z2M_DEVICES_TOPIC, pid);
+    });
+    mqtt.onDisconnect([](AsyncMqttClientDisconnectReason reason) {
+        Serial.printf("MQTT: disconnected (reason %d), retry in 5s\n", (int)reason);
+        mqttRetryAt = millis() + 5000;
+    });
+    mqtt.onMessage(onMqttMessage);
+
+    Serial.printf("MQTT: connecting to %s:%d\n", MQTT_HOST, MQTT_PORT);
+    mqtt.connect();
+}
+
+// ---------------------------------------------------------------------------
 // HTTP routes
 // ---------------------------------------------------------------------------
 static void setupRoutes() {
@@ -448,12 +568,24 @@ void setup() {
     Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
 
     initCC1101();
+    initMqtt();
     setupRoutes();
     server.begin();
     Serial.println("HTTP server started");
 }
 
 void loop() {
+    // One-shot MQTT reconnect: re-arm a connect attempt after a drop.
+    if (mqttRetryAt != 0 && (int32_t)(millis() - mqttRetryAt) >= 0) {
+        mqttRetryAt = 0;
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("MQTT: reconnecting");
+            mqtt.connect();
+        } else {
+            mqttRetryAt = millis() + 5000;   // wait for WiFi to come back
+        }
+    }
+
     // Non-blocking pairing stream: one A/B frame every gap_ms, alternating
     // sp (A) / sp+0.1 (B), until `total` frames have gone out.
     if (pairJob.active && (int32_t)(millis() - pairJob.next_at) >= 0) {

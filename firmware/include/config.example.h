@@ -12,3 +12,10 @@
 #define PIN_MOSI  23
 #define PIN_CS     5
 #define PIN_GDO0   2
+
+// MQTT broker
+#define MQTT_HOST      "192.168.1.10"   // broker IP
+#define MQTT_PORT      1883
+#define MQTT_USER      ""               // "" = anonymous
+#define MQTT_PASSWORD  ""
+#define MQTT_CLIENT_ID "watts-bridge"
