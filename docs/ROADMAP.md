@@ -21,18 +21,25 @@ Status legend: `[x]` done · `[ ]` open · `[~]` partial.
 - [x] HTTP control surface: `/status`, `/tx-test`, `/tx-watts`, `/tx-pair`
 - [x] Non-blocking pairing stream in `loop()` (2 Hz, watchdog-safe)
 
-## M1 — Single-zone live bridge (smallest thing that heats a real floor from HA)
+## M1 — Single-zone live bridge (in progress)
 
 Goal: spoof one captured device ID, driven by HA over MQTT, with on-device control
 and failsafes — no HTTP, no RX, no multi-zone yet.
 
-- [ ] **MQTT client** — wire up the already-bundled `AsyncMqttClient`: connect, reconnect, LWT
+- [~] **MQTT client** — `AsyncMqttClient` wired up: connect + non-blocking 5 s
+      reconnect done (authenticates against HA users; broker settings in `config.h`).
+      LWT still to add.
 - [x] **Characterize Z2M output for the W100** — field reference documented in
       `docs/MQTT_W100.md` from the Z2M device definition (model TH-S04D):
       `temperature` → T, `occupied_heating_setpoint` → SP, `system_mode` → heat/cool/off.
-      Concrete reference case; M1 hard-codes against it, M3 generalizes it via discovery.
-- [ ] **Subscribe** to the W100's `temperature` + `occupied_heating_setpoint`
-      (single zone, hard-coded against `docs/MQTT_W100.md` — a stepping stone, generalized in M3)
+      Confirmed live: two W100s expose a `climate` cluster with `local_temperature`,
+      `occupied_heating_setpoint`, `system_mode`.
+- [x] **Subscribe** to thermostat state — implemented directly via the M3 Z2M
+      auto-discovery path (the hard-coded W100 stepping stone was skipped). Subscribes
+      to each discovered thermostat's `zigbee2mqtt/<name>`, caching `local_temperature`
+      / `occupied_heating_setpoint` / `system_mode` with change-detection so Z2M's
+      redundant full-state republishes (e.g. humidity-only) are ignored. Cached values
+      are the inputs the control loop will read.
 - [ ] **Port the P-loop to firmware** — `duty = clip((SP - T)/Bp, 0, 1)` plus the
       anti-short-cycle clamps and demand-onset / SP-drop exceptions from the emulator
 - [ ] **Steady-state scheduler** — retransmit every 154 s in `loop()`, and fire
@@ -62,10 +69,12 @@ Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 
 - [ ] **NVS device registry** — per channel: name, device ID, source topic, field map
 - [ ] **Per-zone control loop instances** (5 zones: 4 up + 1 down)
-- [ ] **Z2M discovery** — subscribe to retained `zigbee2mqtt/bridge/devices`, filter
-      thermostat-capable devices, read `exposes` for topic + field names. Generalizes
-      the manual M1 W100 characterization so the bridge stays zero-config for users
-      with arbitrary (non-W100) thermostats.
+- [x] **Z2M discovery** (pulled forward, used to satisfy M1's subscribe step) —
+      subscribes to retained `zigbee2mqtt/bridge/devices`, reassembles the fragmented
+      payload, filters for `climate`-type devices, and reads `exposes` for the state
+      topic + field names (temp / setpoint / mode). Zero-config for arbitrary
+      (non-W100) thermostats. Re-runs on every inventory republish. Discovered
+      thermostats held in a fixed registry (`MAX_THERMOSTATS`).
 - [ ] **Binding workflow** — associate a captured Watts channel with a discovered Z2M thermostat
 - [ ] **Pair a new virtual device ID** to replace the broken thermostat
 
