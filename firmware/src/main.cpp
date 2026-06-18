@@ -139,6 +139,19 @@ static const char *Z2M_DEVICES_TOPIC = "zigbee2mqtt/bridge/devices";
 static char  *z2mBuf   = nullptr;   // reassembly buffer, malloc'd per message
 static size_t z2mTotal = 0;         // expected full payload length
 
+// Registry of discovered thermostats. Lets an incoming state message on
+// zigbee2mqtt/<name> be mapped back to the field names found during discovery.
+// Rebuilt every time the inventory is (re)published.
+struct Thermostat {
+    char name[40];        // friendly_name == state topic suffix
+    char tempField[32];   // e.g. local_temperature
+    char spField[32];     // e.g. occupied_heating_setpoint
+    char modeField[32];   // e.g. system_mode (off/heat/cool/auto), "" if none
+};
+static const int MAX_THERMOSTATS = 8;
+static Thermostat thermostats[MAX_THERMOSTATS];
+static int        thermostatCount = 0;
+
 // ---------------------------------------------------------------------------
 // Pairing state. The pairing stream lasts up to 120 s, far too long to run
 // inside an AsyncWebServer callback (that blocks the AsyncTCP task and trips
@@ -377,6 +390,7 @@ static void parseZ2MDevices(const char *json, size_t len) {
     JsonArray devices = doc.as<JsonArray>();
     Serial.printf("Z2M: inventory received (%u devices)\n", devices.size());
 
+    thermostatCount = 0;   // rebuilt from this inventory snapshot
     int found = 0;
     for (JsonObject dev : devices) {
         // definition is null for the coordinator; exposes iterates as empty then.
@@ -386,18 +400,37 @@ static void parseZ2MDevices(const char *json, size_t len) {
 
             const char *name = dev["friendly_name"] | "?";
             const char *ieee = dev["ieee_address"]  | "?";
-            const char *tempProp = nullptr, *spProp = nullptr;
+            const char *tempProp = nullptr, *spProp = nullptr, *modeProp = nullptr;
             for (JsonObject feat : ex["features"].as<JsonArray>()) {
                 const char *prop = feat["property"] | "";
                 if (strcmp(prop, "local_temperature") == 0)      tempProp = prop;
+                else if (strcmp(prop, "system_mode") == 0)       modeProp = prop;
                 else if (strstr(prop, "setpoint") != nullptr)    spProp   = prop;
             }
 
             found++;
             Serial.printf("Z2M thermostat: \"%s\" [%s]\n", name, ieee);
-            Serial.printf("  state topic:    zigbee2mqtt/%s\n", name);
             Serial.printf("  temp field:     %s\n", tempProp ? tempProp : "(none)");
             Serial.printf("  setpoint field: %s\n", spProp   ? spProp   : "(none)");
+            Serial.printf("  mode field:     %s\n", modeProp ? modeProp : "(none)");
+
+            // Register and subscribe to this thermostat's state topic so we get
+            // live local_temperature / occupied_heating_setpoint updates.
+            if (thermostatCount < MAX_THERMOSTATS) {
+                Thermostat &t = thermostats[thermostatCount++];
+                strlcpy(t.name, name, sizeof(t.name));
+                strlcpy(t.tempField, tempProp ? tempProp : "local_temperature",
+                        sizeof(t.tempField));
+                strlcpy(t.spField, spProp ? spProp : "occupied_heating_setpoint",
+                        sizeof(t.spField));
+                strlcpy(t.modeField, modeProp ? modeProp : "", sizeof(t.modeField));
+                char stateTopic[64];
+                snprintf(stateTopic, sizeof(stateTopic), "zigbee2mqtt/%s", name);
+                uint16_t pid = mqtt.subscribe(stateTopic, 0);
+                Serial.printf("  subscribed:     %s (pid %u)\n", stateTopic, pid);
+            } else {
+                Serial.println("  registry full -- not subscribed");
+            }
             break;   // one climate expose per device is enough
         }
     }
@@ -405,13 +438,45 @@ static void parseZ2MDevices(const char *json, size_t len) {
         Serial.println("Z2M: no thermostat-capable devices in inventory");
 }
 
+// Parse a thermostat state message (zigbee2mqtt/<name>) and log the current
+// temperature and setpoint. Z2M publishes the full device state on this topic,
+// so both fields are normally present; a field absent from a partial update
+// reads back as NaN and is shown as "--".
+static void handleStateMessage(const char *topic, const char *payload, size_t len) {
+    const char *suffix = topic + strlen("zigbee2mqtt/");   // name part
+    Thermostat *t = nullptr;
+    for (int i = 0; i < thermostatCount; i++) {
+        if (strcmp(suffix, thermostats[i].name) == 0) { t = &thermostats[i]; break; }
+    }
+    if (!t) return;   // not one of our registered thermostats
+
+    JsonDocument doc;
+    if (deserializeJson(doc, payload, len)) return;
+
+    float temp = doc[t->tempField] | NAN;
+    float sp   = doc[t->spField]   | NAN;
+    // system_mode is a string enum (off/heat/cool/auto), not a number.
+    const char *mode = t->modeField[0] ? (doc[t->modeField] | "--") : "n/a";
+    char tbuf[8], sbuf[8];
+    if (isnan(temp)) strcpy(tbuf, "--"); else snprintf(tbuf, sizeof(tbuf), "%.1f", temp);
+    if (isnan(sp))   strcpy(sbuf, "--"); else snprintf(sbuf, sizeof(sbuf), "%.1f", sp);
+    Serial.printf("Z2M state %s: temp=%s setpoint=%s mode=%s\n",
+                  t->name, tbuf, sbuf, mode);
+}
+
 // AsyncMqttClient message callback. Large retained payloads arrive in fragments
 // (index..index+len of total); reassemble before parsing.
 static void onMqttMessage(char *topic, char *payload,
                           AsyncMqttClientMessageProperties props,
                           size_t len, size_t index, size_t total) {
-    if (strcmp(topic, Z2M_DEVICES_TOPIC) != 0) return;
+    // Thermostat state topics are small single-fragment JSON payloads.
+    if (strcmp(topic, Z2M_DEVICES_TOPIC) != 0) {
+        if (index == 0 && len == total)
+            handleStateMessage(topic, payload, len);
+        return;
+    }
 
+    // The inventory is large and fragmented -- reassemble before parsing.
     if (index == 0) {                 // first fragment: (re)alloc the buffer
         free(z2mBuf);
         z2mBuf   = (char *)malloc(total + 1);
