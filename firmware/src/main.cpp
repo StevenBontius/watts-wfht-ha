@@ -81,7 +81,7 @@
 #define MANCHESTER_ONE_IS_10 1
 
 // Device ID cloned from captures (frame bytes 13..15).
-static const uint8_t DEV_ID[3] = {0x34, 0x9E, 0x67};
+static const uint8_t DEV_ID[3] = {0x34, 0x9E, 0x48};
 
 // Mode byte (frame byte 12). bit1 = heat(1)/cool(0), bit0 = pairing.
 // 0x02 = heat, normal operation, not pairing.
@@ -134,19 +134,29 @@ static AsyncWebServer server(80);
 static AsyncMqttClient mqtt;
 
 // ---------------------------------------------------------------------------
-// RX raw-capture (Step 1: prove we hear the thermostats).
+// RX path. Step 1 (capture): CC1101 in async-serial OOK mode pushes the
+// demodulated envelope out on GDO0; a pin interrupt times the edges into a ring
+// of pulse widths. Step 2 (decode, this layer): loop() groups the pulses into
+// per-burst chip streams, software-Manchester-decodes them (the exact mirror of
+// the TX encoder), finds the D3 91 D3 91 sync, pulls the 16-byte frame and
+// validates both CRCs -- then prints the recovered id / mode / ambient /
+// setpoint / call-for-heat. Toggled over HTTP (/rx-on, /rx-off).
 //
-// CC1101 in async-serial OOK mode pushes the demodulated envelope out on GDO0;
-// we time the edges with a pin interrupt and dump per-burst pulse-width
-// summaries. No Manchester decode yet -- this is just to confirm reception and
-// eyeball the bimodal ~420 us (1 chip) / ~840 us (2 chip) timing. Toggled over
-// HTTP (/rx-on, /rx-off) so it doesn't disturb the TX path.
+// Pulse -> chips: each pulse is one constant-level segment of the OOK envelope.
+// A ~420 us segment is one chip, a ~840 us segment is two chips of that level
+// (threshold 630 us). Level isn't recorded in the ISR; it's reconstructed by
+// parity -- the idle gap that delimits a burst is carrier-low, so the first
+// in-burst segment is always carrier-high, and segments alternate from there.
 // ---------------------------------------------------------------------------
 static const uint16_t PULSE_BUF = 512;
 static volatile uint16_t pulseBuf[PULSE_BUF];
 static volatile uint16_t pulseHead = 0, pulseTail = 0;
 static volatile uint32_t lastEdgeUs = 0;
 static bool rxActive = false;
+
+// Per-burst chip accumulator (one byte per chip, 0/1), drained/decoded in loop().
+static uint8_t rxChips[PULSE_BUF * 2];
+static size_t  rxChipN = 0;
 
 static void IRAM_ATTR gdo0Isr() {
     uint32_t now = micros();
@@ -232,6 +242,118 @@ static uint16_t crc16_cms(const uint8_t *data, size_t len) {
             crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x8005) : (uint16_t)(crc << 1);
     }
     return crc;
+}
+
+// ---------------------------------------------------------------------------
+// RX frame decode (Step 2): chips -> Manchester bits -> sync -> frame -> CRC
+// ---------------------------------------------------------------------------
+
+// Assemble `nbytes` MSB-first bytes starting at bit offset `off` of the packed
+// logical-bit array `bits` (nbits valid). Returns false if the window runs off
+// the end.
+static bool bitsToBytes(const uint8_t *bits, size_t nbits, size_t off,
+                        uint8_t *out, size_t nbytes) {
+    if (off + nbytes * 8 > nbits) return false;
+    for (size_t i = 0; i < nbytes; i++) {
+        uint8_t b = 0;
+        for (int k = 0; k < 8; k++) {
+            size_t bi = off + i * 8 + k;
+            b = (uint8_t)((b << 1) | ((bits[bi >> 3] >> (7 - (bi & 7))) & 1));
+        }
+        out[i] = b;
+    }
+    return true;
+}
+
+// Decode one captured burst of chips into a Watts frame. Two things are unknown
+// and brute-forced: the chip-pairing phase (both offsets tried) and the byte
+// alignment (every bit offset tried). A candidate is only accepted when BOTH
+// CRCs check, so wrong phase/alignment and noise are rejected outright -- the
+// search keeps going on a CRC miss rather than reporting garbage. Returns true
+// and prints once a CRC-valid frame is recovered.
+//
+// Sync is matched on just the second sync word (D3 91); the frame's length byte
+// then sits at off+16. Matching 2 bytes instead of the full D3 91 D3 91 needs
+// only half as many consecutive clean chips and gives two lock points per frame
+// (a bit error in the first sync word no longer loses the frame). The first
+// sync word, if also matched, decodes to a bogus length and fails CRC, so the
+// scan simply advances to the real one -- CRC keeps it honest.
+// Diagnostics for a burst that synced but never passed CRC. Lets loop() dump
+// the recovered bytes so we can inspect frames the decoder can't yet validate
+// (e.g. the suspected off/standby frames). Cleared at the top of every decode.
+struct RxDiag {
+    bool     sawSync;
+    uint8_t  fr[16];
+    uint8_t  crc8_calc, crc8_rx;
+    uint16_t crc16_calc, crc16_rx;
+};
+
+// Pull the 16-byte frame at bit offset `foff`, validate both CRCs, and on
+// success print and return true. On a CRC miss, stash the bytes in `diag` (for
+// loop() to dump) and return false. `foff` is where the length byte should sit.
+static bool validateFrameAt(const uint8_t *bits, size_t nbits, size_t foff,
+                            RxDiag *diag) {
+    uint8_t fr[16];
+    if (!bitsToBytes(bits, nbits, foff, fr, 16)) return false;
+
+    uint8_t  cfh      = fr[12];
+    uint8_t  crc8     = (uint8_t)(crc8_raw(fr, 12) ^ 0xBE ^ cfh);
+    uint16_t crc16    = crc16_cms(fr, 14);
+    uint16_t crc16_rx = (uint16_t)((fr[14] << 8) | fr[15]);
+    if (crc8 != fr[13] || crc16 != crc16_rx) {
+        diag->sawSync    = true;
+        memcpy(diag->fr, fr, 16);
+        diag->crc8_calc  = crc8;  diag->crc8_rx  = fr[13];
+        diag->crc16_calc = crc16; diag->crc16_rx = crc16_rx;
+        return false;
+    }
+
+    float amb = (int16_t)((fr[8]  << 8) | fr[9])  / 10.0f;
+    float sp  = (int16_t)((fr[10] << 8) | fr[11]) / 10.0f;
+    Serial.printf("RX frame: id=%02X%02X%02X mode=0x%02X amb=%.1f sp=%.1f "
+                  "cfh=0x%02X\n",
+                  fr[5], fr[6], fr[7], fr[4], amb, sp, cfh);
+    return true;
+}
+
+static bool decodeBurst(const uint8_t *chips, size_t nchips, RxDiag *diag) {
+    diag->sawSync = false;
+    static uint8_t bits[96];               // packed logical bits (max ~512)
+    for (int phase = 0; phase < 2; phase++) {
+        memset(bits, 0, sizeof(bits));
+        size_t nbits = 0;
+        for (size_t i = phase; i + 1 < nchips; i += 2) {
+            uint8_t a = chips[i], b = chips[i + 1];
+            uint8_t bit;
+#if MANCHESTER_ONE_IS_10
+            if      (a == 1 && b == 0) bit = 1;
+            else if (a == 0 && b == 1) bit = 0;
+            else                       bit = 0;   // invalid pair (wrong phase/noise)
+#else
+            if      (a == 0 && b == 1) bit = 1;
+            else if (a == 1 && b == 0) bit = 0;
+            else                       bit = 0;
+#endif
+            if (nbits >= sizeof(bits) * 8) break;
+            if (bit) bits[nbits >> 3] |= (uint8_t)(0x80 >> (nbits & 7));
+            nbits++;
+        }
+
+        // Sync is D3 91 D3 91. Slide a window for one D3 91 and try the frame at
+        // both byte offsets it could imply: +16 if this was the second sync word
+        // (frame right after), +32 if it was the first (frame after the second
+        // word). Either sync word surviving intact is then enough -- a bit error
+        // in one no longer loses the frame. CRC gates both, so wrong guesses and
+        // noise are rejected and the scan keeps going for a clean copy.
+        for (size_t off = 0; off + 16 <= nbits; off++) {
+            uint8_t s[2];
+            bitsToBytes(bits, nbits, off, s, 2);
+            if (s[0] != 0xD3 || s[1] != 0x91) continue;
+            if (validateFrameAt(bits, nbits, off + 16, diag)) return true;
+            if (validateFrameAt(bits, nbits, off + 32, diag)) return true;
+        }
+    }
+    return false;   // no valid frame in either phase -- noise or a partial burst
 }
 
 // ---------------------------------------------------------------------------
@@ -749,25 +871,48 @@ void loop() {
         }
     }
 
-    // RX raw capture: drain timed edges, group into bursts on a long idle gap,
-    // and print a per-burst summary. A genuine frame is ~100-300 pulses of
-    // ~420/840 us; a >=1500 us gap delimits frames. MIN_PULSES filters noise.
+    // RX decode: drain timed edges into a per-burst chip stream, then on the
+    // long idle gap that delimits a frame, Manchester-decode + CRC-check it. A
+    // genuine frame is ~100-300 pulses of ~420/840 us; a >=1500 us gap delimits
+    // it; bursts under 40 pulses are noise. `level` is reconstructed by parity:
+    // the delimiting gap is carrier-low, so the next segment is carrier-high.
     if (rxActive) {
-        static uint16_t acc = 0;          // pulses in the current burst
-        static uint16_t sample[32];       // first few widths, for eyeballing
-        static uint16_t sampN = 0;
+        static uint16_t acc   = 0;        // pulses in the current burst
+        static uint8_t  level = 1;        // first in-burst segment is high
         while (pulseTail != pulseHead) {
             uint16_t w = pulseBuf[pulseTail];
             pulseTail = (uint16_t)((pulseTail + 1) % PULSE_BUF);
             if (w >= 1500) {              // inter-frame / idle gap -> flush
-                if (acc >= 40) {
-                    Serial.printf("RX burst: %u pulses; first widths(us):", acc);
-                    for (uint16_t i = 0; i < sampN; i++) Serial.printf(" %u", sample[i]);
-                    Serial.println();
+                // A frame ending in a '1' bit is Manchester "10": a high chip
+                // then a low chip. That trailing low chip has no edge after it --
+                // it merges into this idle gap and is never timed, so the frame's
+                // last bit (crc16 LSB) is lost. Append low chips unconditionally
+                // to restore it. This is parity-independent on purpose: a single
+                // spurious/missed pulse mid-burst flips the global chip parity, so
+                // an "append only when odd" rule fires at the wrong time. Padding
+                // is safe regardless -- the frame is anchored at the sync, so any
+                // extra trailing chips are ignored on a frame that was complete.
+                for (int i = 0; i < 2 && rxChipN < sizeof(rxChips); i++)
+                    rxChips[rxChipN++] = 0;
+                RxDiag diag;
+                if (acc >= 40 && !decodeBurst(rxChips, rxChipN, &diag)) {
+                    if (diag.sawSync) {
+                        // Synced but failed CRC -- print the bytes so we can see
+                        // how this frame differs from the ones that validate.
+                        Serial.printf("RX burst: %u pulses, sync ok CRC fail; bytes:", acc);
+                        for (int i = 0; i < 16; i++) Serial.printf(" %02X", diag.fr[i]);
+                        Serial.printf("  crc8 calc=%02X rx=%02X  crc16 calc=%04X rx=%04X\n",
+                                      diag.crc8_calc, diag.crc8_rx,
+                                      diag.crc16_calc, diag.crc16_rx);
+                    } else {
+                        Serial.printf("RX burst: %u pulses, no sync\n", acc);
+                    }
                 }
-                acc = 0; sampN = 0;
+                rxChipN = 0; acc = 0; level = 1;
             } else {
-                if (sampN < 32) sample[sampN++] = w;
+                uint8_t n = (w < 630) ? 1 : 2;   // ~420 us = 1 chip, ~840 us = 2
+                while (n-- && rxChipN < sizeof(rxChips)) rxChips[rxChipN++] = level;
+                level ^= 1;
                 acc++;
             }
         }

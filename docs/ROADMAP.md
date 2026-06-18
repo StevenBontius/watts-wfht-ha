@@ -56,12 +56,17 @@ and failsafes — no HTTP, no RX, no multi-zone yet.
 Goal: the radio can receive, so new device IDs can be registered by switching a
 thermostat off.
 
-- [ ] **CC1101 receive config** + GDO interrupt / FIFO read
-- [ ] **Software Manchester decode** of received frames (mirror the encoder)
-- [ ] **Validate** sync word + both CRCs on RX
+- [x] **CC1101 receive config** + GDO interrupt (async OOK, edge-timed pulse capture)
+- [x] **Software Manchester decode** of received frames (mirror the encoder) —
+      decodes the chip stream, brute-forces pairing phase + byte alignment,
+      restores the swallowed trailing low chip, tolerates a bit error in either
+      sync word
+- [x] **Validate** sync word + both CRCs on RX — CRC-gated, so only clean frames
+      surface; verified live against multiple real thermostats incl. off-frames
 - [ ] **Off-frame detector** — setpoint 0.0 + `FF FF FE` shape → capture device ID (bytes 13..15)
 - [ ] **Pairing-capture flow** — arm "listen for off-frame", surface the captured ID
-- [ ] (Optional) sniff/log real thermostat frames for cross-checking
+- [x] (Optional) sniff/log real thermostat frames for cross-checking — `/rx-on`
+      prints every CRC-valid frame (id, mode, amb, sp, cfh)
 
 ## M3 — Multi-zone + device registry
 
