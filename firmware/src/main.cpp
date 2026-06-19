@@ -21,6 +21,9 @@
  *   GET /pair-listen                             arm off-frame device-ID capture
  *   GET /pair-status                             poll capture result (JSON)
  *   GET /pair-cancel                             disarm capture
+ *   GET /bind?name=<z2m>&id=349E48               bind a Z2M thermostat -> Watts ID
+ *   GET /unbind?name=<z2m>                       drop a binding
+ *   GET /bindings                                list bindings + live state (JSON)
  *   GET /tx-test                                 raw OOK smoke test
  *   GET /tx-watts?amb=22.5&sp=24.0&cfh=0&mode=heat   send a Watts A-B-A burst
  *   GET /tx-pair?duration=30&mode=heat           send pairing frames at 2 Hz
@@ -30,12 +33,15 @@
  */
 
 // ---------------------------------------------------------------------------
-// PLANNED ARCHITECTURE (design notes, not yet implemented)
+// ARCHITECTURE
 // ---------------------------------------------------------------------------
 // The bridge is a transcoder, not a controller-of-record: it reads ambient +
-// setpoint from an HA thermostat over MQTT, runs the P-loop locally to derive
-// call-for-heat, and transmits a Watts frame. HA needs zero configuration; the
-// ESP owns the device registry (NVS) and all coupling.
+// setpoint from an HA/Z2M thermostat over MQTT and relays them to the Watts
+// receiver as spoofed frames. The receiver does its own temperature regulation
+// (confirmed on hardware -- it ignores the call-for-heat flag), so there is no
+// on-device control loop; the scheduler just retransmits each bound zone on the
+// 154 s heartbeat, or immediately when its source state changes. HA needs zero
+// configuration; the ESP owns the bindings (NVS, planned) and all coupling.
 //
 // Pairing has two independent halves, joined on the ESP:
 //
@@ -219,6 +225,35 @@ struct Thermostat {
 static const int MAX_THERMOSTATS = 8;
 static Thermostat thermostats[MAX_THERMOSTATS];
 static int        thermostatCount = 0;
+
+// Zone bindings: a discovered Z2M thermostat (by friendly_name) paired with the
+// Watts device ID the bridge spoofs for it. Kept separate from thermostats[] on
+// purpose -- that array is wiped and rebuilt on every Z2M inventory republish,
+// whereas a binding (and its transmit cadence state) must persist across those
+// rebuilds. Volatile for now; M3 persists these in NVS. Keyed by name, which is
+// also stable enough for the interim /bind UX.
+struct ZoneBinding {
+    bool     used;
+    char     name[40];        // z2m friendly_name this binds to
+    uint8_t  devId[3];        // Watts device ID to transmit for this zone
+    uint32_t lastTxAt;        // millis() of last burst (0 = never sent)
+    bool     dirty;           // source state changed -> transmit asap
+};
+static ZoneBinding bindings[MAX_THERMOSTATS];
+
+static ZoneBinding *findBinding(const char *name) {
+    for (int i = 0; i < MAX_THERMOSTATS; i++)
+        if (bindings[i].used && strcmp(bindings[i].name, name) == 0)
+            return &bindings[i];
+    return nullptr;
+}
+
+// Steady-state transmit cadence: mirror a real thermostat's 154 s heartbeat, and
+// fire immediately when a bound zone's source state changes (dirty). One burst at
+// a time, >= MIN_BURST_GAP apart, so no zone hogs the shared radio.
+static const uint32_t TX_PERIOD_MS    = 154000;
+static const uint32_t MIN_BURST_GAP_MS = 2000;
+static uint32_t       lastBurstAt      = 0;
 
 // ---------------------------------------------------------------------------
 // Pairing state. The pairing stream lasts up to 120 s, far too long to run
@@ -404,7 +439,8 @@ static bool decodeBurst(const uint8_t *chips, size_t nchips,
 //   [21]     CRC-8     over [8..19], then ^0xBE ^byte20
 //   [22..23] CRC-16    over [8..21], big-endian
 //
-static size_t buildFrame(uint8_t *f, float amb_C, float sp_C, uint8_t cfh, uint8_t mode) {
+static size_t buildFrame(uint8_t *f, const uint8_t *devId,
+                         float amb_C, float sp_C, uint8_t cfh, uint8_t mode) {
     int16_t amb = (int16_t)lroundf(amb_C * 10.0f);
     int16_t sp  = (int16_t)lroundf(sp_C  * 10.0f);
 
@@ -416,7 +452,7 @@ static size_t buildFrame(uint8_t *f, float amb_C, float sp_C, uint8_t cfh, uint8
     *p++ = 0x0D;                                               // length
     *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFE;                     // header
     *p++ = mode;                                               // mode
-    *p++ = DEV_ID[0]; *p++ = DEV_ID[1]; *p++ = DEV_ID[2];      // device id
+    *p++ = devId[0]; *p++ = devId[1]; *p++ = devId[2];         // device id
     *p++ = (uint8_t)((amb >> 8) & 0xFF); *p++ = (uint8_t)(amb & 0xFF);
     *p++ = (uint8_t)((sp  >> 8) & 0xFF); *p++ = (uint8_t)(sp  & 0xFF);
     *p++ = cfh;                                                // call-for-heat
@@ -473,10 +509,11 @@ static void cc1101SendRaw(const uint8_t *data, uint8_t len) {
     ELECHOUSE_cc1101.SpiStrobe(CC1101_SFTX);
 }
 
-// Build, encode and transmit a single frame.
-static void sendFrameOnce(float amb, float sp, uint8_t cfh, uint8_t mode) {
+// Build, encode and transmit a single frame for device `devId`.
+static void sendFrameOnce(const uint8_t *devId, float amb, float sp,
+                          uint8_t cfh, uint8_t mode) {
     uint8_t frame[24];
-    buildFrame(frame, amb, sp, cfh, mode);   // 2a aa aa aa | sync | payload..crc16
+    buildFrame(frame, devId, amb, sp, cfh, mode);   // 2a aa aa aa | sync | payload..crc16
 
     // Mirror the real device exactly: ONE continuous Manchester stream, with NO
     // raw (non-Manchester) lead-in or lead-out. The earlier raw 0x55 lead-in was
@@ -509,12 +546,64 @@ static void sendFrameOnce(float amb, float sp, uint8_t cfh, uint8_t mode) {
 // lower of a pair as the real setpoint. This is the single transmit path:
 //   normal state change -> count=3, gap=400 (A-B-A)
 //   pairing             -> count=duration*2, gap=500 (2 Hz A-B-A-B-... stream)
-static void sendBurst(float amb, float sp, uint8_t cfh, uint8_t mode,
-                      int count, uint32_t gap_ms) {
+static void sendBurst(const uint8_t *devId, float amb, float sp, uint8_t cfh,
+                      uint8_t mode, int count, uint32_t gap_ms) {
     for (int i = 0; i < count; i++) {
-        sendFrameOnce(amb, (i & 1) ? sp + 0.1f : sp, cfh, mode);
+        sendFrameOnce(devId, amb, (i & 1) ? sp + 0.1f : sp, cfh, mode);
         if (i < count - 1) delay(gap_ms);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Steady-state per-zone scheduler
+// ---------------------------------------------------------------------------
+
+// Map a bound zone's cached Z2M state to the Watts wire values. heat -> mode
+// 0x02, cool -> 0x00 (byte-12 bit1). "off" keeps the last heat/cool bit but
+// zeroes the setpoint -- exactly what a real thermostat transmits when switched
+// off, which the temperature-regulating receiver reads as "no demand".
+static void zoneTxValues(const Thermostat *t, float *outSp, uint8_t *outMode) {
+    *outMode = (strcmp(t->lastMode, "cool") == 0) ? 0x00 : 0x02;
+    *outSp   = (strcmp(t->lastMode, "off") == 0) ? 0.0f : t->lastSp;
+}
+
+// Transmit at most one A-B-A burst per call, >= MIN_BURST_GAP apart so no zone
+// hogs the shared radio. A zone whose source just changed (dirty) jumps ahead of
+// zones merely due for their 154 s heartbeat. Skipped while RX is active -- the
+// radio is in async-OOK receive config then (e.g. during pairing), and steady
+// heartbeats resume once RX is off. Call every loop().
+static void serviceScheduler() {
+    if (rxActive) return;
+    uint32_t now = millis();
+    if (now - lastBurstAt < MIN_BURST_GAP_MS) return;
+
+    Thermostat  *zt = nullptr;
+    ZoneBinding *zb = nullptr;
+
+    // Pass 0: a bound zone whose state changed. Pass 1: one due for a heartbeat.
+    for (int pass = 0; pass < 2 && !zb; pass++) {
+        for (int i = 0; i < thermostatCount; i++) {
+            Thermostat &t = thermostats[i];
+            if (isnan(t.lastTemp) || isnan(t.lastSp)) continue;   // no data yet
+            ZoneBinding *b = findBinding(t.name);
+            if (!b) continue;                                     // unbound
+            bool ready = (pass == 0)
+                         ? b->dirty
+                         : (b->lastTxAt == 0 || now - b->lastTxAt >= TX_PERIOD_MS);
+            if (ready) { zt = &t; zb = b; break; }
+        }
+    }
+    if (!zb) return;
+
+    float sp; uint8_t mode;
+    zoneTxValues(zt, &sp, &mode);
+    sendBurst(zb->devId, zt->lastTemp, sp, 0x00, mode, 3, 400);   // A-B-A, cfh=0
+    zb->lastTxAt = millis();
+    zb->dirty    = false;
+    lastBurstAt  = millis();
+    Serial.printf("TX zone \"%s\": id=%02X%02X%02X amb=%.1f sp=%.1f mode=0x%02X\n",
+                  zt->name, zb->devId[0], zb->devId[1], zb->devId[2],
+                  zt->lastTemp, sp, mode);
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +787,11 @@ static void handleStateMessage(const char *topic, const char *payload, size_t le
     }
     if (!changed) return;   // redundant republish (e.g. humidity-only) -- ignore
 
+    // A real change on a bound zone means the receiver needs the new values now,
+    // not at the next 154 s heartbeat -- flag it for the scheduler.
+    ZoneBinding *b = findBinding(t->name);
+    if (b) b->dirty = true;
+
     char tbuf[8], sbuf[8];
     if (isnan(t->lastTemp)) strcpy(tbuf, "--"); else snprintf(tbuf, sizeof(tbuf), "%.1f", t->lastTemp);
     if (isnan(t->lastSp))   strcpy(sbuf, "--"); else snprintf(sbuf, sizeof(sbuf), "%.1f", t->lastSp);
@@ -767,6 +861,20 @@ static void initMqtt() {
 // ---------------------------------------------------------------------------
 // HTTP routes
 // ---------------------------------------------------------------------------
+
+// Parse a 6-hex-digit device ID ("349E48") into 3 bytes. False on bad input.
+static bool parseHexId(const String &s, uint8_t out[3]) {
+    if (s.length() != 6) return false;
+    for (int i = 0; i < 3; i++) {
+        char  buf[3] = { s[i * 2], s[i * 2 + 1], 0 };
+        char *end;
+        long  v = strtol(buf, &end, 16);
+        if (*end != 0) return false;
+        out[i] = (uint8_t)v;
+    }
+    return true;
+}
+
 static void setupRoutes() {
     server.on("/status", HTTP_GET, [](AsyncWebServerRequest *req) {
         JsonDocument doc;
@@ -829,6 +937,75 @@ static void setupRoutes() {
         req->send(200, "text/plain", "pairing cancelled");
     });
 
+    // Zone bindings: tie a discovered Z2M thermostat (friendly_name) to the Watts
+    // device ID the scheduler should spoof for it. Volatile until M3's NVS store.
+    server.on("/bind", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->hasParam("name") || !req->hasParam("id")) {
+            req->send(400, "text/plain", "usage: /bind?name=<z2m-name>&id=AABBCC");
+            return;
+        }
+        String  name = req->getParam("name")->value();
+        uint8_t id[3];
+        if (!parseHexId(req->getParam("id")->value(), id)) {
+            req->send(400, "text/plain", "id must be 6 hex digits, e.g. 349E48");
+            return;
+        }
+        ZoneBinding *b = findBinding(name.c_str());
+        if (!b)                                         // allocate a free slot
+            for (int i = 0; i < MAX_THERMOSTATS; i++)
+                if (!bindings[i].used) { b = &bindings[i]; break; }
+        if (!b) { req->send(507, "text/plain", "binding table full"); return; }
+
+        b->used = true;
+        strlcpy(b->name, name.c_str(), sizeof(b->name));
+        memcpy(b->devId, id, 3);
+        b->lastTxAt = 0;
+        b->dirty    = true;                             // transmit asap
+        char resp[96];
+        snprintf(resp, sizeof(resp), "bound \"%s\" -> %02X%02X%02X",
+                 b->name, id[0], id[1], id[2]);
+        Serial.println(resp);
+        req->send(200, "text/plain", resp);
+    });
+    server.on("/unbind", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->hasParam("name")) {
+            req->send(400, "text/plain", "usage: /unbind?name=<z2m-name>");
+            return;
+        }
+        ZoneBinding *b = findBinding(req->getParam("name")->value().c_str());
+        if (!b) { req->send(404, "text/plain", "no such binding"); return; }
+        b->used = false;
+        Serial.printf("unbound \"%s\"\n", b->name);
+        req->send(200, "text/plain", "unbound");
+    });
+    server.on("/bindings", HTTP_GET, [](AsyncWebServerRequest *req) {
+        JsonDocument doc;
+        JsonArray    arr = doc.to<JsonArray>();
+        uint32_t     now = millis();
+        for (int i = 0; i < MAX_THERMOSTATS; i++) {
+            if (!bindings[i].used) continue;
+            JsonObject o = arr.add<JsonObject>();
+            o["name"] = bindings[i].name;
+            char id[7];
+            snprintf(id, sizeof(id), "%02X%02X%02X",
+                     bindings[i].devId[0], bindings[i].devId[1], bindings[i].devId[2]);
+            o["id"]            = id;
+            o["last_tx_age_s"] = bindings[i].lastTxAt
+                                 ? (int)((now - bindings[i].lastTxAt) / 1000) : -1;
+            // Fold in the live source values if the thermostat is discovered.
+            for (int j = 0; j < thermostatCount; j++) {
+                if (strcmp(thermostats[j].name, bindings[i].name) != 0) continue;
+                if (!isnan(thermostats[j].lastTemp)) o["temp"] = thermostats[j].lastTemp;
+                if (!isnan(thermostats[j].lastSp))   o["setpoint"] = thermostats[j].lastSp;
+                if (thermostats[j].lastMode[0])      o["mode"] = thermostats[j].lastMode;
+                break;
+            }
+        }
+        String body;
+        serializeJson(doc, body);
+        req->send(200, "application/json", body);
+    });
+
     // Raw lead-in burst, a quick "is the PA keying" smoke test.
     server.on("/tx-test", HTTP_GET, [](AsyncWebServerRequest *req) {
         uint8_t buf[16];
@@ -856,7 +1033,7 @@ static void setupRoutes() {
             mode = m.equalsIgnoreCase("cool") ? 0x00 : 0x02;
         }
 
-        sendBurst(amb, sp, cfh, mode, 3, 400);   // A-B-A
+        sendBurst(DEV_ID, amb, sp, cfh, mode, 3, 400);   // A-B-A
 
         char resp[96];
         snprintf(resp, sizeof(resp),
@@ -1019,7 +1196,7 @@ void loop() {
     // sp (A) / sp+0.1 (B), until `total` frames have gone out.
     if (pairJob.active && (int32_t)(millis() - pairJob.next_at) >= 0) {
         bool isB = pairJob.sent & 1;
-        sendFrameOnce(pairJob.amb, isB ? pairJob.sp + 0.1f : pairJob.sp,
+        sendFrameOnce(DEV_ID, pairJob.amb, isB ? pairJob.sp + 0.1f : pairJob.sp,
                       0x00, pairJob.mode);
         pairJob.sent++;
         if (pairJob.sent >= pairJob.total) {
@@ -1029,4 +1206,8 @@ void loop() {
             pairJob.next_at = millis() + pairJob.gap_ms;
         }
     }
+
+    // Steady-state bridge: relay each bound zone's ambient + setpoint to the
+    // Watts receiver on the 154 s heartbeat, or immediately on a state change.
+    serviceScheduler();
 }

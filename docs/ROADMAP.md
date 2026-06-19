@@ -49,8 +49,12 @@ receiver that actuates on call-for-heat.
       / `occupied_heating_setpoint` / `system_mode` with change-detection so Z2M's
       redundant full-state republishes (e.g. humidity-only) are ignored. Cached values
       are the inputs the control loop will read.
-- [ ] **Steady-state scheduler** — retransmit every 154 s in `loop()`, and fire
-      immediately on a state change (setpoint or mode change)
+- [x] **Steady-state scheduler** — multi-zone from the start: per-bound-zone 154 s
+      heartbeat in `loop()`, fires immediately on a source change (setpoint/mode),
+      maps heat/cool→mode byte and Z2M `off`→setpoint 0.0. One A-B-A burst at a
+      time, ≥2 s apart, so zones don't collide on the shared radio. Interim
+      `/bind` / `/unbind` / `/bindings` tie a Z2M thermostat to a Watts device ID
+      (volatile; M3 persists in NVS)
 - [ ] **Stale-data failsafe** — if no valid MQTT update within the safety window
       (≈60 min), drive a safe fallback setpoint (e.g. anti-freeze) until data
       resumes. (Forcing cfh=0x00 is useless here — the receiver ignores it.)
@@ -91,10 +95,12 @@ thermostat off.
 
 Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 
-- [ ] **NVS device registry** — per channel: name, device ID, source topic, field map
-- [ ] **Per-zone transmit instances** (5 zones: 4 up + 1 down) — each just relays
-      its bound thermostat's ambient + setpoint on the heartbeat (no per-zone
-      P-loop; receiver self-regulates)
+- [ ] **NVS device registry** — persist the `bindings[]` table (name, device ID,
+      cadence state) across reboots; the M1 `/bind` table is volatile today
+- [~] **Per-zone transmit instances** (5 zones: 4 up + 1 down) — multi-zone
+      scheduler done in M1 (each zone relays its bound thermostat's ambient +
+      setpoint on the heartbeat, no per-zone P-loop). Remaining: NVS persistence
+      and validating all five zones together
 - [x] **Z2M discovery** (pulled forward, used to satisfy M1's subscribe step) —
       subscribes to retained `zigbee2mqtt/bridge/devices`, reassembles the fragmented
       payload, filters for `climate`-type devices, and reads `exposes` for the state
