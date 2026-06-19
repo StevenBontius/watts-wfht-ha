@@ -219,9 +219,10 @@ struct Thermostat {
     // Latest cached values (NAN / "" until the first state message). Z2M
     // republishes the full state on every attribute report (incl. ones we
     // ignore, like humidity), so we cache and only act/log on real changes.
-    float lastTemp;
-    float lastSp;
-    char  lastMode[32];
+    float    lastTemp;
+    float    lastSp;
+    char     lastMode[32];
+    uint32_t lastUpdateMs;   // millis() of last state message (0 = never), liveness
 };
 static const int MAX_THERMOSTATS = 8;
 static Thermostat thermostats[MAX_THERMOSTATS];
@@ -239,6 +240,7 @@ struct ZoneBinding {
     uint8_t  devId[3];        // Watts device ID to transmit for this zone
     uint32_t lastTxAt;        // millis() of last burst (0 = never sent)  [runtime]
     bool     dirty;           // source state changed -> transmit asap    [runtime]
+    bool     stale;           // source went quiet -> TX dropped          [runtime]
 };
 static ZoneBinding bindings[MAX_THERMOSTATS];
 
@@ -275,6 +277,7 @@ static void loadBindings() {
     for (int i = 0; i < MAX_THERMOSTATS; i++) {
         bindings[i].lastTxAt = 0;       // runtime fields are meaningless after a
         bindings[i].dirty    = false;   // reboot -- start each zone fresh
+        bindings[i].stale    = false;
         if (bindings[i].used) {
             n++;
             Serial.printf("NVS binding: \"%s\" -> %02X%02X%02X\n", bindings[i].name,
@@ -290,6 +293,15 @@ static void loadBindings() {
 static const uint32_t TX_PERIOD_MS    = 154000;
 static const uint32_t MIN_BURST_GAP_MS = 2000;
 static uint32_t       lastBurstAt      = 0;
+
+// Stale-source failsafe: if a bound zone's MQTT source goes quiet for this long,
+// stop transmitting it entirely rather than relay a frozen ambient/setpoint
+// forever (which the temperature-regulating receiver would happily keep acting
+// on). Going silent makes the receiver see a lost thermostat and fall back to its
+// own built-in handling (it beeps). MUST exceed the source's longest quiet
+// interval -- raise it if a healthy zone gets dropped (nuisance beep). The W100
+// reports periodically even when idle, so this is generous on purpose.
+static const uint32_t ZONE_STALE_MS = 60UL * 60 * 1000;   // 60 min
 
 // ---------------------------------------------------------------------------
 // Pairing state. The pairing stream lasts up to 120 s, far too long to run
@@ -623,6 +635,20 @@ static void serviceScheduler() {
             if (isnan(t.lastTemp) || isnan(t.lastSp)) continue;   // no data yet
             ZoneBinding *b = findBinding(t.name);
             if (!b) continue;                                     // unbound
+
+            // Stale-source failsafe: stop transmitting a zone whose source has
+            // gone quiet, rather than relay frozen values. Going silent lets the
+            // receiver flag a lost thermostat and fall back on its own.
+            if (now - t.lastUpdateMs > ZONE_STALE_MS) {
+                if (!b->stale) {
+                    b->stale = true;
+                    Serial.printf("zone \"%s\": source stale (%lus) -- dropping TX; "
+                                  "receiver will flag lost thermostat\n",
+                                  t.name, (unsigned long)((now - t.lastUpdateMs) / 1000));
+                }
+                continue;
+            }
+
             bool ready = (pass == 0)
                          ? b->dirty
                          : (b->lastTxAt == 0 || now - b->lastTxAt >= TX_PERIOD_MS);
@@ -776,6 +802,7 @@ static void parseZ2MDevices(const char *json, size_t len) {
                 t.lastTemp = NAN;
                 t.lastSp   = NAN;
                 t.lastMode[0] = '\0';
+                t.lastUpdateMs = 0;
                 char stateTopic[64];
                 snprintf(stateTopic, sizeof(stateTopic), "zigbee2mqtt/%s", name);
                 uint16_t pid = mqtt.subscribe(stateTopic, 0);
@@ -805,6 +832,16 @@ static void handleStateMessage(const char *topic, const char *payload, size_t le
     JsonDocument doc;
     if (deserializeJson(doc, payload, len)) return;
 
+    // Any message on this topic -- even a humidity-only republish -- proves the
+    // thermostat is alive, so it's the liveness signal for the stale failsafe.
+    // If the zone had been dropped as stale, the source just came back.
+    t->lastUpdateMs = millis();
+    ZoneBinding *b  = findBinding(t->name);
+    if (b && b->stale) {
+        b->stale = false;
+        Serial.printf("zone \"%s\": source recovered -- resuming TX\n", t->name);
+    }
+
     float temp = doc[t->tempField] | NAN;
     float sp   = doc[t->spField]   | NAN;
     // system_mode is a string enum (off/heat/cool/auto), not a number.
@@ -825,7 +862,6 @@ static void handleStateMessage(const char *topic, const char *payload, size_t le
 
     // A real change on a bound zone means the receiver needs the new values now,
     // not at the next 154 s heartbeat -- flag it for the scheduler.
-    ZoneBinding *b = findBinding(t->name);
     if (b) b->dirty = true;
 
     char tbuf[8], sbuf[8];
@@ -997,6 +1033,7 @@ static void setupRoutes() {
         memcpy(b->devId, id, 3);
         b->lastTxAt = 0;
         b->dirty    = true;                             // transmit asap
+        b->stale    = false;
         saveBindings();                                 // persist to NVS
         char resp[96];
         snprintf(resp, sizeof(resp), "bound \"%s\" -> %02X%02X%02X",
@@ -1030,6 +1067,7 @@ static void setupRoutes() {
             o["id"]            = id;
             o["last_tx_age_s"] = bindings[i].lastTxAt
                                  ? (int)((now - bindings[i].lastTxAt) / 1000) : -1;
+            o["stale"]         = bindings[i].stale;
             // Fold in the live source values if the thermostat is discovered.
             for (int j = 0; j < thermostatCount; j++) {
                 if (strcmp(thermostats[j].name, bindings[i].name) != 0) continue;

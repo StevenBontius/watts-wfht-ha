@@ -55,9 +55,13 @@ receiver that actuates on call-for-heat.
       time, ≥2 s apart, so zones don't collide on the shared radio. Interim
       `/bind` / `/unbind` / `/bindings` tie a Z2M thermostat to a Watts device ID
       (volatile; M3 persists in NVS)
-- [ ] **Stale-data failsafe** — if no valid MQTT update within the safety window
-      (≈60 min), drive a safe fallback setpoint (e.g. anti-freeze) until data
-      resumes. (Forcing cfh=0x00 is useless here — the receiver ignores it.)
+- [x] **Stale-data failsafe** — if a bound zone's MQTT source goes quiet past
+      `ZONE_STALE_MS` (60 min), **stop transmitting it** rather than relay frozen
+      values. Going silent makes the receiver see a lost thermostat and fall back
+      on its own built-in handling (it beeps). No invented anti-freeze setpoint;
+      it leans on the hardware's own loss detection. Resumes automatically when
+      the source returns. Threshold must exceed the source's longest quiet
+      interval (raise if a healthy zone gets dropped). See [[receiver-beeps-on-lost-thermostat]].
 - [ ] _(back burner — nice-to-have)_ **Port the P-loop to firmware** —
       `duty = clip((SP - T)/Bp, 0, 1)` plus the anti-short-cycle clamps and
       demand-onset / SP-drop exceptions from the emulator. Unnecessary while the
