@@ -23,8 +23,17 @@ Status legend: `[x]` done · `[ ]` open · `[~]` partial.
 
 ## M1 — Single-zone live bridge (in progress)
 
-Goal: spoof one captured device ID, driven by HA over MQTT, with on-device control
-and failsafes — no HTTP, no RX, no multi-zone yet.
+Goal: spoof one captured device ID, driven by HA over MQTT, transmitting accurate
+ambient + setpoint on the heartbeat, with failsafes — no HTTP, no RX, no
+multi-zone yet.
+
+**Note (confirmed on hardware):** the WFHC-MASTER receiver does its own
+temperature regulation and **ignores the call-for-heat flag** — it actuates on
+the transmitted ambient vs. setpoint alone. So the on-device P-loop is
+unnecessary for this stack; the bridge just transmits the real ambient + setpoint
+and runs the master in Comfort mode (HA is the sole scheduler). The P-loop /
+duty→cfh items below are **back-burnered** — kept only for a hypothetical dumb
+receiver that actuates on call-for-heat.
 
 - [~] **MQTT client** — `AsyncMqttClient` wired up: connect + non-blocking 5 s
       reconnect done (authenticates against HA users; broker settings in `config.h`).
@@ -40,13 +49,18 @@ and failsafes — no HTTP, no RX, no multi-zone yet.
       / `occupied_heating_setpoint` / `system_mode` with change-detection so Z2M's
       redundant full-state republishes (e.g. humidity-only) are ignored. Cached values
       are the inputs the control loop will read.
-- [ ] **Port the P-loop to firmware** — `duty = clip((SP - T)/Bp, 0, 1)` plus the
-      anti-short-cycle clamps and demand-onset / SP-drop exceptions from the emulator
 - [ ] **Steady-state scheduler** — retransmit every 154 s in `loop()`, and fire
-      immediately on a state change (setpoint or call-for-heat flip)
-- [ ] **Map duty → call-for-heat flag** (0x00 / 0x64) on the cycle boundary
+      immediately on a state change (setpoint or mode change)
 - [ ] **Stale-data failsafe** — if no valid MQTT update within the safety window
-      (≈60 min), force idle (0x00) until data resumes
+      (≈60 min), drive a safe fallback setpoint (e.g. anti-freeze) until data
+      resumes. (Forcing cfh=0x00 is useless here — the receiver ignores it.)
+- [ ] _(back burner — nice-to-have)_ **Port the P-loop to firmware** —
+      `duty = clip((SP - T)/Bp, 0, 1)` plus the anti-short-cycle clamps and
+      demand-onset / SP-drop exceptions from the emulator. Unnecessary while the
+      receiver self-regulates (see note above)
+- [ ] _(back burner — nice-to-have)_ **Map duty → call-for-heat flag**
+      (0x00 / 0x64) on the cycle boundary — only meaningful if the P-loop runs;
+      cfh is otherwise transmitted as a constant benign 0x00
 - [ ] **Publish state** back to MQTT (current cfh, duty, last-tx age) for observability
 - [ ] **Retire / gate the HTTP test endpoints** behind a debug build flag
 - [ ] Field test against the real Watts receiver (one zone)
@@ -78,7 +92,9 @@ thermostat off.
 Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 
 - [ ] **NVS device registry** — per channel: name, device ID, source topic, field map
-- [ ] **Per-zone control loop instances** (5 zones: 4 up + 1 down)
+- [ ] **Per-zone transmit instances** (5 zones: 4 up + 1 down) — each just relays
+      its bound thermostat's ambient + setpoint on the heartbeat (no per-zone
+      P-loop; receiver self-regulates)
 - [x] **Z2M discovery** (pulled forward, used to satisfy M1's subscribe step) —
       subscribes to retained `zigbee2mqtt/bridge/devices`, reassembles the fragmented
       payload, filters for `climate`-type devices, and reads `exposes` for the state
