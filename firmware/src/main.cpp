@@ -76,6 +76,7 @@
 #include <ArduinoJson.h>
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <AsyncMqttClient.h>
+#include <Preferences.h>
 #include <math.h>
 #include <string.h>
 #include "config.h"
@@ -229,15 +230,15 @@ static int        thermostatCount = 0;
 // Zone bindings: a discovered Z2M thermostat (by friendly_name) paired with the
 // Watts device ID the bridge spoofs for it. Kept separate from thermostats[] on
 // purpose -- that array is wiped and rebuilt on every Z2M inventory republish,
-// whereas a binding (and its transmit cadence state) must persist across those
-// rebuilds. Volatile for now; M3 persists these in NVS. Keyed by name, which is
-// also stable enough for the interim /bind UX.
+// whereas a binding must persist across those rebuilds. The {used, name, devId}
+// identity is persisted in NVS (survives reboots); lastTxAt/dirty are runtime
+// cadence state, reset on boot. Keyed by name, stable enough for the /bind UX.
 struct ZoneBinding {
     bool     used;
     char     name[40];        // z2m friendly_name this binds to
     uint8_t  devId[3];        // Watts device ID to transmit for this zone
-    uint32_t lastTxAt;        // millis() of last burst (0 = never sent)
-    bool     dirty;           // source state changed -> transmit asap
+    uint32_t lastTxAt;        // millis() of last burst (0 = never sent)  [runtime]
+    bool     dirty;           // source state changed -> transmit asap    [runtime]
 };
 static ZoneBinding bindings[MAX_THERMOSTATS];
 
@@ -246,6 +247,41 @@ static ZoneBinding *findBinding(const char *name) {
         if (bindings[i].used && strcmp(bindings[i].name, name) == 0)
             return &bindings[i];
     return nullptr;
+}
+
+// NVS persistence for bindings. The whole array is stored as one blob, guarded by
+// a version key so a future ZoneBinding layout change ignores stale data rather
+// than loading garbage. Writes happen only on /bind and /unbind (infrequent).
+static Preferences   prefs;
+static const char   *NVS_NS  = "watts";
+static const char   *NVS_KEY = "bindings";
+static const uint32_t NVS_VER = 1;
+
+static void saveBindings() {
+    prefs.begin(NVS_NS, false);
+    prefs.putUInt("ver", NVS_VER);
+    prefs.putBytes(NVS_KEY, bindings, sizeof(bindings));
+    prefs.end();
+}
+
+static void loadBindings() {
+    prefs.begin(NVS_NS, true);   // read-only
+    if (prefs.getUInt("ver", 0) == NVS_VER &&
+        prefs.getBytesLength(NVS_KEY) == sizeof(bindings)) {
+        prefs.getBytes(NVS_KEY, bindings, sizeof(bindings));
+    }
+    prefs.end();
+    int n = 0;
+    for (int i = 0; i < MAX_THERMOSTATS; i++) {
+        bindings[i].lastTxAt = 0;       // runtime fields are meaningless after a
+        bindings[i].dirty    = false;   // reboot -- start each zone fresh
+        if (bindings[i].used) {
+            n++;
+            Serial.printf("NVS binding: \"%s\" -> %02X%02X%02X\n", bindings[i].name,
+                          bindings[i].devId[0], bindings[i].devId[1], bindings[i].devId[2]);
+        }
+    }
+    Serial.printf("NVS: loaded %d binding(s)\n", n);
 }
 
 // Steady-state transmit cadence: mirror a real thermostat's 154 s heartbeat, and
@@ -938,7 +974,7 @@ static void setupRoutes() {
     });
 
     // Zone bindings: tie a discovered Z2M thermostat (friendly_name) to the Watts
-    // device ID the scheduler should spoof for it. Volatile until M3's NVS store.
+    // device ID the scheduler should spoof for it. Persisted in NVS on change.
     server.on("/bind", HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!req->hasParam("name") || !req->hasParam("id")) {
             req->send(400, "text/plain", "usage: /bind?name=<z2m-name>&id=AABBCC");
@@ -961,6 +997,7 @@ static void setupRoutes() {
         memcpy(b->devId, id, 3);
         b->lastTxAt = 0;
         b->dirty    = true;                             // transmit asap
+        saveBindings();                                 // persist to NVS
         char resp[96];
         snprintf(resp, sizeof(resp), "bound \"%s\" -> %02X%02X%02X",
                  b->name, id[0], id[1], id[2]);
@@ -975,6 +1012,7 @@ static void setupRoutes() {
         ZoneBinding *b = findBinding(req->getParam("name")->value().c_str());
         if (!b) { req->send(404, "text/plain", "no such binding"); return; }
         b->used = false;
+        saveBindings();                                 // persist to NVS
         Serial.printf("unbound \"%s\"\n", b->name);
         req->send(200, "text/plain", "unbound");
     });
@@ -1101,6 +1139,7 @@ void setup() {
     }
     Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
 
+    loadBindings();   // restore zone bindings from NVS before MQTT/discovery
     initCC1101();
     initMqtt();
     setupRoutes();

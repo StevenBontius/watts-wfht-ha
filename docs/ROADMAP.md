@@ -95,12 +95,14 @@ thermostat off.
 
 Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 
-- [ ] **NVS device registry** — persist the `bindings[]` table (name, device ID,
-      cadence state) across reboots; the M1 `/bind` table is volatile today
+- [x] **NVS device registry** — the `bindings[]` table (name + device ID) is
+      persisted in NVS via `Preferences`, written on `/bind` / `/unbind` and
+      restored at boot; a version key invalidates stale layouts. Runtime cadence
+      state (lastTxAt/dirty) is intentionally not persisted
 - [~] **Per-zone transmit instances** (5 zones: 4 up + 1 down) — multi-zone
-      scheduler done in M1 (each zone relays its bound thermostat's ambient +
-      setpoint on the heartbeat, no per-zone P-loop). Remaining: NVS persistence
-      and validating all five zones together
+      scheduler (M1) + persisted bindings done; each zone relays its bound
+      thermostat's ambient + setpoint on the heartbeat (no per-zone P-loop).
+      Remaining: validate all five zones together on real hardware
 - [x] **Z2M discovery** (pulled forward, used to satisfy M1's subscribe step) —
       subscribes to retained `zigbee2mqtt/bridge/devices`, reassembles the fragmented
       payload, filters for `climate`-type devices, and reads `exposes` for the state
