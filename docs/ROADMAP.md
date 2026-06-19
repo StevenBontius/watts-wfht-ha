@@ -51,7 +51,7 @@ and failsafes — no HTTP, no RX, no multi-zone yet.
 - [ ] **Retire / gate the HTTP test endpoints** behind a debug build flag
 - [ ] Field test against the real Watts receiver (one zone)
 
-## M2 — RX path + pairing capture
+## M2 — RX path + pairing capture ✅ (done)
 
 Goal: the radio can receive, so new device IDs can be registered by switching a
 thermostat off.
@@ -63,10 +63,15 @@ thermostat off.
       sync word
 - [x] **Validate** sync word + both CRCs on RX — CRC-gated, so only clean frames
       surface; verified live against multiple real thermostats incl. off-frames
-- [ ] **Off-frame detector** — setpoint 0.0 + `FF FF FE` shape → capture device ID (bytes 13..15)
-- [ ] **Pairing-capture flow** — arm "listen for off-frame", surface the captured ID
+- [x] **Off-frame detector** — a CRC-valid frame with setpoint 0.0 latches its
+      3-byte device ID (the `FF FF FE` shape is implicit: the header is inside
+      the CRC-8 coverage). Captures the A-frame; the 0.1 B-frame twin is ignored
+- [x] **Pairing-capture flow** — `/pair-listen` arms (auto-enables RX),
+      `/pair-status` polls the JSON result, `/pair-cancel` disarms; one-shot, and
+      RX goes quiet after capture if pairing was what turned it on
 - [x] (Optional) sniff/log real thermostat frames for cross-checking — `/rx-on`
-      prints every CRC-valid frame (id, mode, amb, sp, cfh)
+      prints every CRC-valid frame (id, mode, amb, sp, cfh); `RX_DEBUG` flag dumps
+      rejected bursts for protocol work
 
 ## M3 — Multi-zone + device registry
 

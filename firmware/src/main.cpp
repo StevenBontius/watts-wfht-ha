@@ -17,6 +17,10 @@
  *
  * Endpoints:
  *   GET /status                                  radio + config info
+ *   GET /rx-on  /rx-off                          listen for + decode Watts frames
+ *   GET /pair-listen                             arm off-frame device-ID capture
+ *   GET /pair-status                             poll capture result (JSON)
+ *   GET /pair-cancel                             disarm capture
  *   GET /tx-test                                 raw OOK smoke test
  *   GET /tx-watts?amb=22.5&sp=24.0&cfh=0&mode=heat   send a Watts A-B-A burst
  *   GET /tx-pair?duration=30&mode=heat           send pairing frames at 2 Hz
@@ -79,6 +83,12 @@
 //   0 -> the inverse
 // Start at 1. If the decoder is silent or CRCs fail, set to 0 and reflash.
 #define MANCHESTER_ONE_IS_10 1
+
+// RX diagnostics. When 1, loop() dumps every burst that synced but failed CRC
+// (and "no sync" bursts) -- handy for protocol debugging, noisy in normal use.
+// When 0, only CRC-valid frames and PAIR events are printed. Set to 1 + reflash
+// when you need to inspect frames the decoder rejects.
+#define RX_DEBUG 0
 
 // Device ID cloned from captures (frame bytes 13..15).
 static const uint8_t DEV_ID[3] = {0x34, 0x9E, 0x48};
@@ -157,6 +167,16 @@ static bool rxActive = false;
 // Per-burst chip accumulator (one byte per chip, 0/1), drained/decoded in loop().
 static uint8_t rxChips[PULSE_BUF * 2];
 static size_t  rxChipN = 0;
+
+// Off-frame pairing capture. A thermostat switched off broadcasts setpoint-0.0
+// frames (rare in normal use), so arming this and switching one off ties a
+// physical thermostat to its 3-byte device ID. One-shot: the first CRC-valid
+// sp==0 frame latches the ID and disarms, so a unit left off doesn't re-trigger.
+static bool    pairArmed     = false;
+static bool    pairCaptured  = false;
+static bool    pairStartedRx = false; // pairing turned RX on -> turn it back off
+static uint8_t pairId[3]     = {0, 0, 0};
+static float   pairAmb       = NAN;   // ambient on the captured frame, for context
 
 static void IRAM_ATTR gdo0Isr() {
     uint32_t now = micros();
@@ -288,11 +308,22 @@ struct RxDiag {
     uint16_t crc16_calc, crc16_rx;
 };
 
-// Pull the 16-byte frame at bit offset `foff`, validate both CRCs, and on
-// success print and return true. On a CRC miss, stash the bytes in `diag` (for
+// A decoded, CRC-valid frame handed back to the caller. Keeping decode free of
+// policy: decodeBurst just produces one of these, and loop() prints it and
+// decides what to do with it (logging, off-frame pairing capture, ...).
+struct DecodedFrame {
+    uint8_t id[3];
+    uint8_t mode;
+    float   amb;
+    float   sp;
+    uint8_t cfh;
+};
+
+// Pull the 16-byte frame at bit offset `foff` and validate both CRCs. On success
+// fill `*out` and return true; on a CRC miss, stash the bytes in `diag` (for
 // loop() to dump) and return false. `foff` is where the length byte should sit.
 static bool validateFrameAt(const uint8_t *bits, size_t nbits, size_t foff,
-                            RxDiag *diag) {
+                            DecodedFrame *out, RxDiag *diag) {
     uint8_t fr[16];
     if (!bitsToBytes(bits, nbits, foff, fr, 16)) return false;
 
@@ -308,15 +339,16 @@ static bool validateFrameAt(const uint8_t *bits, size_t nbits, size_t foff,
         return false;
     }
 
-    float amb = (int16_t)((fr[8]  << 8) | fr[9])  / 10.0f;
-    float sp  = (int16_t)((fr[10] << 8) | fr[11]) / 10.0f;
-    Serial.printf("RX frame: id=%02X%02X%02X mode=0x%02X amb=%.1f sp=%.1f "
-                  "cfh=0x%02X\n",
-                  fr[5], fr[6], fr[7], fr[4], amb, sp, cfh);
+    out->id[0] = fr[5]; out->id[1] = fr[6]; out->id[2] = fr[7];
+    out->mode  = fr[4];
+    out->amb   = (int16_t)((fr[8]  << 8) | fr[9])  / 10.0f;
+    out->sp    = (int16_t)((fr[10] << 8) | fr[11]) / 10.0f;
+    out->cfh   = cfh;
     return true;
 }
 
-static bool decodeBurst(const uint8_t *chips, size_t nchips, RxDiag *diag) {
+static bool decodeBurst(const uint8_t *chips, size_t nchips,
+                        DecodedFrame *out, RxDiag *diag) {
     diag->sawSync = false;
     static uint8_t bits[96];               // packed logical bits (max ~512)
     for (int phase = 0; phase < 2; phase++) {
@@ -349,8 +381,8 @@ static bool decodeBurst(const uint8_t *chips, size_t nchips, RxDiag *diag) {
             uint8_t s[2];
             bitsToBytes(bits, nbits, off, s, 2);
             if (s[0] != 0xD3 || s[1] != 0x91) continue;
-            if (validateFrameAt(bits, nbits, off + 16, diag)) return true;
-            if (validateFrameAt(bits, nbits, off + 32, diag)) return true;
+            if (validateFrameAt(bits, nbits, off + 16, out, diag)) return true;
+            if (validateFrameAt(bits, nbits, off + 32, out, diag)) return true;
         }
     }
     return false;   // no valid frame in either phase -- noise or a partial burst
@@ -741,7 +773,14 @@ static void setupRoutes() {
         doc["ip"]   = WiFi.localIP().toString();
         doc["rssi"] = WiFi.RSSI();
         doc["manchester_one_is_10"] = (int)MANCHESTER_ONE_IS_10;
-        doc["rx_active"] = rxActive;
+        doc["rx_active"]   = rxActive;
+        doc["pair_armed"]  = pairArmed;
+        doc["pair_captured"] = pairCaptured;
+        if (pairCaptured) {
+            char id[7];
+            snprintf(id, sizeof(id), "%02X%02X%02X", pairId[0], pairId[1], pairId[2]);
+            doc["pair_id"] = id;
+        }
         String body;
         serializeJson(doc, body);
         req->send(200, "application/json", body);
@@ -755,6 +794,39 @@ static void setupRoutes() {
     server.on("/rx-off", HTTP_GET, [](AsyncWebServerRequest *req) {
         rxDisable();
         req->send(200, "text/plain", "rx off");
+    });
+
+    // Off-frame pairing capture. Arm, then switch a thermostat off: the first
+    // CRC-valid setpoint-0.0 frame latches its device ID. Auto-enables RX.
+    server.on("/pair-listen", HTTP_GET, [](AsyncWebServerRequest *req) {
+        pairStartedRx = !rxActive;   // remember if we had to enable RX ourselves
+        if (!rxActive) rxEnable();
+        pairArmed    = true;
+        pairCaptured = false;
+        pairId[0] = pairId[1] = pairId[2] = 0;
+        pairAmb      = NAN;
+        Serial.println("PAIR: armed -- switch a thermostat OFF to capture its ID");
+        req->send(200, "text/plain",
+                  "pairing armed -- switch a thermostat OFF, then poll /pair-status");
+    });
+    server.on("/pair-status", HTTP_GET, [](AsyncWebServerRequest *req) {
+        JsonDocument doc;
+        doc["armed"]    = pairArmed;
+        doc["captured"] = pairCaptured;
+        if (pairCaptured) {
+            char id[7];
+            snprintf(id, sizeof(id), "%02X%02X%02X", pairId[0], pairId[1], pairId[2]);
+            doc["id"]  = id;
+            doc["amb"] = pairAmb;
+        }
+        String body;
+        serializeJson(doc, body);
+        req->send(200, "application/json", body);
+    });
+    server.on("/pair-cancel", HTTP_GET, [](AsyncWebServerRequest *req) {
+        pairArmed = false;
+        Serial.println("PAIR: cancelled");
+        req->send(200, "text/plain", "pairing cancelled");
     });
 
     // Raw lead-in burst, a quick "is the PA keying" smoke test.
@@ -894,8 +966,32 @@ void loop() {
                 // extra trailing chips are ignored on a frame that was complete.
                 for (int i = 0; i < 2 && rxChipN < sizeof(rxChips); i++)
                     rxChips[rxChipN++] = 0;
+                DecodedFrame f;
                 RxDiag diag;
-                if (acc >= 40 && !decodeBurst(rxChips, rxChipN, &diag)) {
+                if (acc >= 40 && decodeBurst(rxChips, rxChipN, &f, &diag)) {
+                    Serial.printf("RX frame: id=%02X%02X%02X mode=0x%02X amb=%.1f "
+                                  "sp=%.1f cfh=0x%02X\n",
+                                  f.id[0], f.id[1], f.id[2], f.mode,
+                                  f.amb, f.sp, f.cfh);
+
+                    // Off-frame pairing capture: a setpoint of exactly 0.0 means
+                    // the thermostat was switched off (its A-frame; the B-frame
+                    // twin carries 0.1). Latch the first one while armed.
+                    if (pairArmed && !pairCaptured && f.sp == 0.0f) {
+                        memcpy(pairId, f.id, 3);
+                        pairAmb      = f.amb;
+                        pairCaptured = true;
+                        pairArmed    = false;
+                        Serial.printf("PAIR: captured off-frame -> id=%02X%02X%02X "
+                                      "(amb=%.1f)\n",
+                                      pairId[0], pairId[1], pairId[2], pairAmb);
+                        // Stop listening once we have the ID, but only if pairing
+                        // is what turned RX on -- leave a manual /rx-on session be.
+                        if (pairStartedRx) { rxDisable(); pairStartedRx = false; }
+                    }
+                }
+#if RX_DEBUG
+                else if (acc >= 40) {
                     if (diag.sawSync) {
                         // Synced but failed CRC -- print the bytes so we can see
                         // how this frame differs from the ones that validate.
@@ -908,6 +1004,7 @@ void loop() {
                         Serial.printf("RX burst: %u pulses, no sync\n", acc);
                     }
                 }
+#endif
                 rxChipN = 0; acc = 0; level = 1;
             } else {
                 uint8_t n = (w < 630) ? 1 : 2;   // ~420 us = 1 chip, ~840 us = 2
