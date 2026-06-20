@@ -172,9 +172,12 @@ regressions and the failure modes that hardware testing doesn't exercise.
       and re-ran Z2M discovery on reconnect; both zones kept transmitting from cache
       mid-outage (heartbeat is decoupled from MQTT, and a broker bounce is far short
       of the 60 min `ZONE_STALE_MS` drop threshold)
-- [ ] **M1** — LWT/availability: pull power (not a clean disconnect), confirm the
+- [x] **M1** — LWT/availability: pull power (not a clean disconnect), confirm the
       broker publishes `offline` on `watts-bridge/status` and HA marks the device
       unavailable; on reboot confirm `online` + a fresh `diag` blob + `reset_reason`
+      — confirmed on hardware: ungraceful power loss fired the retained will
+      (`offline`, HA greyed the bridge + zones out), and reboot republished
+      `online` with a fresh diag blob.
 - [ ] **M2** — RX loopback: encode → decode roundtrip in firmware; assert recovered
       bytes + CRCs match the source frame
 - [ ] **M3** — registry persistence: write channels to NVS, reboot, confirm they reload
