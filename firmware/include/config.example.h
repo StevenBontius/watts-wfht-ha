@@ -29,6 +29,14 @@
 #define MQTT_PASSWORD  ""
 #define MQTT_CLIENT_ID "watts-bridge"
 
+// Web UI login. A non-empty password requires a login (HTTP Digest auth -- the
+// password is never sent in cleartext) on every served route; the captive setup
+// portal is exempt. Like the WiFi/MQTT values, these are only first-boot SEED
+// defaults -- the captive portal's "Web UI login" fields override them and NVS
+// then wins. Leave the password "" to serve the UI openly.
+#define HTTP_USER "admin"
+#define HTTP_PASS ""
+
 // Debug/test HTTP endpoints. When 1, exposes the unauthenticated /status,
 // /rx-on, /rx-off, /tx-test and /tx-watts endpoints -- handy for radio
 // bring-up, but any host on the LAN can then key the PA / actuate heating.

@@ -115,6 +115,18 @@
 #define DEBUG_HTTP 0
 #endif
 
+// HTTP auth for the operational web UI. A non-empty password requires a login
+// (HTTP Digest, so the password is never sent in cleartext) on every served
+// route; the captive setup portal is exempt. These macros are only first-boot
+// SEED defaults -- the captive portal provisions httpUser/httpPass into NVS,
+// which then wins (see NetConfig). Empty password = UI served openly.
+#ifndef HTTP_USER
+#define HTTP_USER "admin"
+#endif
+#ifndef HTTP_PASS
+#define HTTP_PASS ""
+#endif
+
 // Reported to HA on the diagnostics blob so you know what's actually flashed
 // without a serial console. Bump on each flash you care to distinguish.
 #define FW_VERSION "m3-dev"
@@ -170,6 +182,7 @@ static const uint8_t MODE_HEAT_NORMAL = 0x02;
 #endif
 
 static AsyncWebServer server(80);
+static AsyncAuthenticationMiddleware httpAuth;   // gates the operational routes
 static AsyncMqttClient mqtt;
 
 // ---------------------------------------------------------------------------
@@ -335,9 +348,11 @@ struct NetConfig {
     char     mqttUser[33];
     char     mqttPass[65];
     char     mqttClientId[33];
+    char     httpUser[33];   // web-UI login; empty httpPass disables auth
+    char     httpPass[65];
 };
 static NetConfig      netCfg;
-static const uint32_t NET_VER = 1;
+static const uint32_t NET_VER = 2;   // bumped for httpUser/httpPass -- old blobs reseed
 
 static void saveNetConfig() {
     prefs.begin(NVS_NS, false);
@@ -365,6 +380,8 @@ static void loadNetConfig() {
         strlcpy(netCfg.mqttUser,     MQTT_USER,      sizeof(netCfg.mqttUser));
         strlcpy(netCfg.mqttPass,     MQTT_PASSWORD,  sizeof(netCfg.mqttPass));
         strlcpy(netCfg.mqttClientId, MQTT_CLIENT_ID, sizeof(netCfg.mqttClientId));
+        strlcpy(netCfg.httpUser,     HTTP_USER,      sizeof(netCfg.httpUser));
+        strlcpy(netCfg.httpPass,     HTTP_PASS,      sizeof(netCfg.httpPass));
         Serial.println("NVS: no net config -- seeded from config.h defaults");
     } else {
         Serial.printf("NVS: net config loaded (ssid=\"%s\" mqtt=%s:%u)\n",
@@ -1445,6 +1462,12 @@ static const char PORTAL_HTML[] PROGMEM = R"HTML(<!doctype html>
   <div class="pw"><input name="mpass" type="password">
    <button type="button" onclick="tog(this)" aria-label="Show password"></button></div>
  </fieldset>
+ <fieldset><legend>Web UI login</legend>
+  <label>Username</label><input name="huser" value="admin">
+  <label>Password (blank = no login required)</label>
+  <div class="pw"><input name="hpass" type="password">
+   <button type="button" onclick="tog(this)" aria-label="Show password"></button></div>
+ </fieldset>
  <button type="submit">Save &amp; reboot</button>
 </form>
 <script>
@@ -1476,6 +1499,8 @@ static void setupPortalRoutes() {
         strlcpy(netCfg.mqttUser, field("muser").c_str(),sizeof(netCfg.mqttUser));
         strlcpy(netCfg.mqttPass, field("mpass").c_str(),sizeof(netCfg.mqttPass));
         strlcpy(netCfg.mqttClientId, MQTT_CLIENT_ID,    sizeof(netCfg.mqttClientId));
+        strlcpy(netCfg.httpUser, field("huser").c_str(),sizeof(netCfg.httpUser));
+        strlcpy(netCfg.httpPass, field("hpass").c_str(),sizeof(netCfg.httpPass));
         saveNetConfig();
         Serial.printf("PORTAL: saved ssid=\"%s\" mqtt=%s:%u -- rebooting\n",
                       netCfg.wifiSsid, netCfg.mqttHost, netCfg.mqttPort);
@@ -1658,6 +1683,23 @@ refresh();setInterval(()=>{if(!pairTimer)loadBindings();},5000);
 </script></body></html>)HTML";
 
 static void setupRoutes() {
+    // Require a login on every operational route. Credentials come from the
+    // runtime NetConfig (set in the captive portal, seeded from config.h); an
+    // empty password serves the UI openly. Added before any server.on() so the
+    // middleware wraps all handlers registered below.
+    if (strlen(netCfg.httpPass) > 0) {
+        httpAuth.setUsername(netCfg.httpUser[0] ? netCfg.httpUser : "admin");
+        httpAuth.setPassword(netCfg.httpPass);
+        httpAuth.setRealm("Watts Bridge");
+        httpAuth.setAuthType(AsyncAuthType::AUTH_DIGEST);
+        httpAuth.setAuthFailureMessage("Authentication required");
+        httpAuth.generateHash();        // precompute so each request skips hashing
+        server.addMiddleware(&httpAuth);
+        Serial.println("HTTP: digest auth enabled");
+    } else {
+        Serial.println("HTTP: auth DISABLED (HTTP_PASS empty) -- UI served openly");
+    }
+
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
         req->send(200, "text/html", INDEX_HTML);
     });
