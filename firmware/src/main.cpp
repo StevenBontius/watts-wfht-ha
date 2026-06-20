@@ -117,9 +117,9 @@
 
 // HTTP auth for the operational web UI. A non-empty password requires a login
 // (HTTP Digest, so the password is never sent in cleartext) on every served
-// route; the captive setup portal is exempt. These macros are only first-boot
-// SEED defaults -- the captive portal provisions httpUser/httpPass into NVS,
-// which then wins (see NetConfig). Empty password = UI served openly.
+// route; the captive setup portal is exempt. Precedence (see loadNetConfig): a
+// non-empty HTTP_PASS here is authoritative and overrides NVS every boot; leave
+// it "" to manage the password from the captive portal instead (or serve openly).
 #ifndef HTTP_USER
 #define HTTP_USER "admin"
 #endif
@@ -386,6 +386,16 @@ static void loadNetConfig() {
     } else {
         Serial.printf("NVS: net config loaded (ssid=\"%s\" mqtt=%s:%u)\n",
                       netCfg.wifiSsid, netCfg.mqttHost, netCfg.mqttPort);
+    }
+
+    // The web login is the one field config.h stays authoritative for: a non-empty
+    // HTTP_PASS overrides whatever NVS holds (applied in RAM each boot, not saved),
+    // so editing config.h + reflashing always takes effect without wiping NVS. Leave
+    // HTTP_PASS "" to instead manage the password from the captive portal.
+    if (strlen(HTTP_PASS) > 0) {
+        strlcpy(netCfg.httpUser, HTTP_USER, sizeof(netCfg.httpUser));
+        strlcpy(netCfg.httpPass, HTTP_PASS, sizeof(netCfg.httpPass));
+        Serial.println("NET: web login overridden from config.h HTTP_PASS");
     }
 }
 

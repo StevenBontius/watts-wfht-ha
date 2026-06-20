@@ -31,9 +31,10 @@
 
 // Web UI login. A non-empty password requires a login (HTTP Digest auth -- the
 // password is never sent in cleartext) on every served route; the captive setup
-// portal is exempt. Like the WiFi/MQTT values, these are only first-boot SEED
-// defaults -- the captive portal's "Web UI login" fields override them and NVS
-// then wins. Leave the password "" to serve the UI openly.
+// portal is exempt. Unlike WiFi/MQTT, the password is authoritative here: a
+// non-empty HTTP_PASS overrides NVS on every boot, so editing it + reflashing
+// always takes effect. Leave it "" to manage the password from the captive
+// portal's "Web UI login" field instead, or to serve the UI openly.
 #define HTTP_USER "admin"
 #define HTTP_PASS ""
 
