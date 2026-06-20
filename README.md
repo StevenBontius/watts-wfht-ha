@@ -4,13 +4,17 @@ Replacing Watts WFHT-RF legacy underfloor heating thermostats with a headless Ho
 
 By intercepting the proprietary RF layer of existing HVAC installations, this bridge modernizes disconnected hydronic underfloor heating (UFH) systems without requiring an expensive mechanical overhaul of the manifold, valves, or pumps.
 
-**Status:** Single-zone live bridge confirmed on hardware — the full
-HA → MQTT → ESP32 → CC1101 → receiver path drives the real Watts receiver and
-actuates a zone end-to-end. (Phase 1 RF capture & protocol characterization
-complete.) Remaining: simultaneous five-zone validation, failsafe/resilience
-tests, and headless HA UX — see [`docs/ROADMAP.md`](/docs/ROADMAP.md).
+**Status:** The single-zone live bridge is confirmed end-to-end on real hardware —
+the full HA → MQTT → ESP32 → CC1101 → receiver path actuates a real Watts zone.
+MQTT-resilience, LWT/availability and the stale-data failsafe are all validated on
+hardware. Also shipped: the RX path with off-frame pairing capture, NVS-persisted
+multi-zone bindings, captive-portal WiFi/MQTT provisioning, a self-contained web UI
+(binding **and** receiver pairing), and self-announcing per-zone Home Assistant
+discovery entities. Remaining: simultaneous five-zone validation on hardware,
+per-zone parental lock, and gating the HTTP debug endpoints behind a build flag —
+see [`docs/ROADMAP.md`](/docs/ROADMAP.md).
 
-[Watts WFHT RF Protocol Reverse Engineering](/docs/WATTS_WFHT_RF_PROTOCOL.md)
+The reverse engineering process of the wireless communication can be found here: [Watts WFHT RF Protocol Reverse Engineering](/docs/WATTS_WFHT_RF_PROTOCOL.md)
 
 All reverse engineering findings for capturing packets have been incorporated into this [forked rtl_433 decoder](https://github.com/StevenBontius/rtl_433). Pending merge with mainline `rtl-433`.
 
@@ -22,62 +26,103 @@ All reverse engineering findings for capturing packets have been incorporated in
 
 ## System Architecture & Data Flow
 
-The bridge functions as a silent translator, decoupling the user interface from the physical heating execution layer. 
+The bridge functions as a silent translator, decoupling the user interface from the physical heating execution layer.
 
 ### How a setpoint reaches the floor
 
-Uses an Aqara w100 thermostat, but could use any thermostat that can be coupled to Home Assistant or publish its temperature and setpoint to an MQTT broker.
+This setup uses an Aqara W100 thermostat, but could use any thermostat that can be coupled to Home Assistant or publish its temperature and setpoint to an MQTT broker.
 
 ```text
 Aqara W100 (temp + humidity + up/down/scene buttons)
         │
         ▼  (Zigbee via Zigbee2MQTT)
    Home Assistant
-        │     measured room temp: Relayed to MQTT topic
-        │     setpoint:           From HA schedule/automation or local W100 
-        │                         buttons (subject to parental lock)
+        │     measured room temp:  relayed to an MQTT topic
+        │     setpoint:            from HA schedule/automation or the local
+        │                          W100 buttons (subject to parental lock)
         ▼
    MQTT Broker
         │
-        ▼  (Subscribed by standalone ESP32 firmware)
-   ESP32 (Edge Intelligence Layer)
-        │     - Runs local PI control loop (Bp=2.0°C, Cy=900s, On/Of=120s)
-        │     - Calculates active duty fraction and target call-for-heat flag (0x64 or 0x00)
-        │     - Calculates custom application CRC-8
+        ▼  (subscribed by the standalone ESP32 firmware)
+   ESP32 bridge
+        │     - caches each bound zone's ambient + setpoint + mode
+        │     - builds the 192-bit fixed frame + custom application CRC-8
+        │       + radio CRC-16
+        │     - call-for-heat byte sent as a constant benign 0x00
+        │       (the receiver ignores it — see below)
         ▼
    CC1101 Radio Transceiver
-        │     - Formats 192-bit fixed packet with 0xD391 sync word
-        │     - Transmits A-B-A burst every 154 seconds (or instantly on state change)
-        ▼  (433.92 MHz, spoofed Watts WFHT-RF OOK Manchester packet)
+        │     - 0xD391 sync word, A-B-A burst every 154 s (or instantly on change)
+        ▼  (433.92 MHz, spoofed Watts WFHT-RF OOK/Manchester packet)
   Watts Central Receiver
-        │
+        │     - runs its own temperature regulation from ambient vs. setpoint
         ▼
    Manifold servo for the zone opens/closes the water loop
-
 ```
+
+### Why there is no control loop on the ESP32
+
+Confirmed on hardware: the **WFHC-MASTER receiver does its own temperature
+regulation and ignores the call-for-heat flag**  it actuates on the transmitted
+ambient vs. setpoint alone. So the bridge is a pure relay: it transmits the real
+ambient + setpoint, sends call-for-heat as a constant benign `0x00`, and the master
+runs in **Comfort mode** with Home Assistant as the sole scheduler.
+
+A chronoproportional P-controller (`duty = clip((SP − T)/Bp, 0, 1)`, with
+anti-short-cycle clamps) *is* implemented and validated in the Python emulator
+(`tools/wfht_emulator.py`), but it is **back-burnered** for this stack — kept only
+for a hypothetical dumb receiver that actuates on the call-for-heat flag instead of
+self-regulating.
 
 ### Edge Resiliency
 
-The architecture features layered redundancy to ensure the system remains safe and stable even if components or network connections fail:
+The architecture features layered redundancy to keep the system safe and stable even when components or network connections fail:
 
-* **Inherent Hardware Failsafe**: The physical Watts manifold receiver expects a regular heartbeat. If the ESP32 bridge loses power or suffers a critical hardware failure and stops transmitting its 154-second steady-state broadcasts, the Watts receiver detects the signal loss and automatically drops the affected zones into a safe, factory-default state.
+* **Inherent Hardware Failsafe**: The physical Watts manifold receiver expects a regular heartbeat. If the ESP32 bridge loses power or suffers a critical hardware failure and stops transmitting its 154-second steady-state broadcasts, the receiver detects the loss (it beeps) and drops the affected zone into its safe, factory-default state.
 
-* **Edge Intelligence (Short-Term Resiliency)**: Because the chronoproportional PI control loop runs directly on the ESP32 microcontroller, the system gracefully handles brief upstream disconnections. If Home Assistant restarts or the Wi-Fi drops temporarily, the ESP32 continues executing the active PI loop using the last known setpoint and ambient temperature.
+* **Decoupled Heartbeat (Short-Term Resiliency)**: The 154 s transmit cadence runs independently of MQTT. If Home Assistant restarts or Wi-Fi/the broker drops briefly, the ESP32 keeps transmitting each zone's **last-known ambient + setpoint from cache**, backed by a non-blocking 5 s MQTT reconnect.
 
-* **Software Timeout Failsafe (Extended Network Drop)**: To prevent runaway heating or freezing based on stale data, the ESP32 monitors the age of incoming MQTT payloads. If no valid sensor update or heartbeat is received from Home Assistant within a defined safety window (e.g., 60 minutes), the ESP32 aborts the active control loop. It will explicitly transmit an idle flag (0x00) to the Watts receiver, forcing the system into a failsafe standby or frost-protection mode until network communication is reliably reestablished.
+* **Stale-Data Failsafe (Extended Network Drop)**: To avoid relaying frozen values indefinitely, the ESP32 tracks the age of each zone's incoming MQTT data. If a source goes quiet past the safety window (`ZONE_STALE_MS`, 60 min), the bridge **stops transmitting that zone** rather than inventing a value. Going silent makes the receiver see a lost thermostat and fall back on its own loss handling, leaning on the hardware's built-in detection. The zone resumes automatically when its source returns.
 
-### Headless Integration & Local Input
+### Provisioning & Web UI
 
-The bridge works entirely behind the scenes via background MQTT topics. It does not generate cluttered, duplicate climate dashboard entities in Home Assistant, allowing the user interface to remain focused on modern smart sensors like the Aqara W100.
+The bridge is field-provisionable without a reflash. On first boot (or after a
+20 s STA-connect timeout) it comes up as an open access point `watts-bridge-XXXX`
+with a DNS catch-all, serving a setup form; WiFi + MQTT credentials are saved to
+NVS and the device reboots into station mode. `config.h` macros are only first-boot
+seed defaults — once the portal saves, NVS is authoritative.
 
-Each zone features a lock toggle in Home Assistant. When a zone is locked, local Zigbee button presses for that zone are ignored, preventing accidental or unauthorized schedule overrides.
+In normal operation the device serves a self-contained config page (no external/CDN
+assets) at `GET /` that makes both binding and pairing a no-typing browser task:
+
+* lists current bindings with live state and an Unbind button;
+* a dropdown of auto-discovered Z2M thermostats (zero-config — read from the Z2M
+  `bridge/devices` inventory);
+* a **Capture ID** button that arms RX and auto-fills the Watts ID when a thermostat
+  is switched off, showing the captured ambient temperature so you can confirm it's
+  the right room before binding;
+* a per-zone **Pair** button that initiates the receiver-pairing sequence (see below)
+  with a live countdown.
+
+### Headless Home Assistant Integration
+
+The bridge works behind the scenes over MQTT and does **not** create cluttered,
+duplicate *climate* dashboard entities, the UI stays focused on the Aqara W100s.
+It does self-announce lightweight MQTT-discovery entities: a bridge device
+(connectivity + diagnostics: RSSI, uptime, reset reason, last-TX age, IP, firmware)
+and one nested device per bound zone (status, transmitted setpoint/ambient, mode,
+last-TX age, spoofed Watts ID), all sharing the bridge's LWT so a dead bridge greys
+everything out together.
+
+*Planned:* a per-zone parental lock toggle that gates the local W100 button input on
+or off, preventing accidental or unauthorized schedule overrides.
 
 ### Spoofing and Pairing Capabilities
 
-The bridge requires both capabilities for MVP:
+The bridge supports both, and both can be driven from the web UI:
 
-1. **Spoofing existing device IDs:** For thermostats that still work, the ESP32 clones their 3-byte hardware identifier (e.g., `34:94:2B`). The Watts receiver cannot tell the difference.
-2. **Pairing new virtual device IDs:** To replace broken thermostats or subdivide zones, the ESP32 can initiate a pairing sequence. It achieves this by transmitting at a rapid 2 Hz cadence (~500 ms) with bit 0 of byte 12 set to `1`, registering a brand-new virtual thermostat with the physical Watts receiver.
+1. **Spoofing existing device IDs:** For thermostats that still work, the ESP32 clones their 3-byte hardware identifier (e.g., `34:9E:48`) — captured off-air by switching the thermostat off. The Watts receiver cannot tell the difference.
+2. **Pairing new virtual device IDs:** To replace broken thermostats or subdivide zones, the bridge initiates a pairing sequence. Transmitting at a rapid 2 Hz cadence (~500 ms) with bit 0 of byte 12 set to `1` — registering a brand-new virtual thermostat with the physical Watts receiver. Put the receiver zone into learn mode, then hit **Pair** on that zone in the web UI; the bridge streams pairing frames carrying the zone's live ambient + setpoint for ~30 s.
 
 ### Hardware
 
@@ -94,7 +139,7 @@ The bridge requires both capabilities for MVP:
 **In the heating MVP:**
 
 * All four upstairs zones plus the single downstairs zone running through the ESP32 bridge.
-* Local execution of the chronoproportional PI loop on the ESP32 for edge resiliency.
+* The bridge as a pure ambient + setpoint relay, with the Watts receiver self-regulating in Comfort mode (no per-zone control loop on the ESP32).
 * Replacement of the broken thermostat via a newly paired virtual device ID.
 * Home Assistant owning setpoints (schedules, presence, holiday mode) with W100 buttons as the per-room local override.
 * Per-zone parental lock toggling local button input on or off.
