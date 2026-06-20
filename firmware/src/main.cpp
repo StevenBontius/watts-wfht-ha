@@ -258,8 +258,13 @@ static ZoneBinding *findBinding(const char *name) {
 
 // Per-zone HA state publishing lives with the MQTT layer further down, but the
 // scheduler and the Z2M message handler (both above it) trigger it on every TX
-// and on a source change/recovery -- so it's forward-declared here.
-static void publishZoneState(const ZoneBinding *b);
+// and on a source change/recovery -- so it's forward-declared here. Returns the
+// publish packet-id (0 = the send buffer was full and nothing was queued).
+static uint16_t publishZoneState(const ZoneBinding *b);
+
+// Request a paced (re)advertise of every retained config (see the sequencer near
+// the MQTT layer). Triggered on connect and on /bind; loop() drains it.
+static void startAdvertise();
 
 // NVS persistence for bindings. The whole array is stored as one blob, guarded by
 // a version key so a future ZoneBinding layout change ignores stale data rather
@@ -649,12 +654,21 @@ static void serviceScheduler() {
             // Stale-source failsafe: stop transmitting a zone whose source has
             // gone quiet, rather than relay frozen values. Going silent lets the
             // receiver flag a lost thermostat and fall back on its own.
-            if (now - t.lastUpdateMs > ZONE_STALE_MS) {
+            //
+            // lastUpdateMs is written by the Z2M state callback on the AsyncTCP
+            // task, concurrently with this loop. Snapshot it once, and compute the
+            // age signed: a message landing just after we sampled `now` leaves
+            // lastUpdateMs a few ms ahead of `now`, and an unsigned (now - lu)
+            // would underflow to ~2^32 and spuriously trip the failsafe (the
+            // "stale (4294967s)" flapping). A negative signed age == fresh.
+            uint32_t lu  = t.lastUpdateMs;            // single concurrent read
+            int32_t  age = (int32_t)(now - lu);
+            if (lu != 0 && age > (int32_t)ZONE_STALE_MS) {
                 if (!b->stale) {
                     b->stale = true;
                     Serial.printf("zone \"%s\": source stale (%lus) -- dropping TX; "
                                   "receiver will flag lost thermostat\n",
-                                  t.name, (unsigned long)((now - t.lastUpdateMs) / 1000));
+                                  t.name, (unsigned long)(age / 1000));
                     publishZoneState(b);   // reflect the drop in HA immediately
                 }
                 continue;
@@ -951,7 +965,7 @@ static const char *resetReasonName(esp_reset_reason_t r) {
 // Publish the current health blob. last_tx_age is the domain-specific field: -1
 // until the first burst, then seconds since lastBurstAt -- crossing ~160 s while
 // "online" still holds means the radio is wedged though MQTT/WiFi are fine.
-static void publishDiag() {
+static uint16_t publishDiag() {
     JsonDocument doc;
     doc["rssi"]         = WiFi.RSSI();
     doc["uptime"]       = millis() / 1000;           // wraps at ~49 days; fine here
@@ -962,13 +976,13 @@ static void publishDiag() {
     doc["fw"]           = FW_VERSION;
     String body;
     serializeJson(doc, body);
-    mqtt.publish(DIAG_TOPIC, 1, true, body.c_str());
+    return mqtt.publish(DIAG_TOPIC, 1, true, body.c_str());
 }
 
 // One diagnostic sensor's HA discovery config, sourced from the DIAG blob.
-static void publishSensorDiscovery(const char *object, const char *name,
-                                   const char *valueKey, const char *devClass,
-                                   const char *unit) {
+static uint16_t publishSensorDiscovery(const char *object, const char *name,
+                                       const char *valueKey, const char *devClass,
+                                       const char *unit) {
     JsonDocument doc;
     doc["name"] = name;
     char uid[48];
@@ -990,15 +1004,14 @@ static void publishSensorDiscovery(const char *object, const char *name,
              "homeassistant/sensor/watts_bridge/%s/config", object);
     String body;
     serializeJson(doc, body);
-    mqtt.publish(topic, 1, true, body.c_str());
+    return mqtt.publish(topic, 1, true, body.c_str());
 }
 
-// Retained HA MQTT-discovery configs. Republished on every (re)connect on
-// purpose: idempotent, and it re-seeds the entities if the broker dropped its
-// retained set. The connectivity binary_sensor carries the full device block
-// (the sensors reference it by shared identifier) and uses the LWT topic, so HA
-// greys every entity out together the moment the bridge dies.
-static void publishDiscovery() {
+// The bridge's connectivity binary_sensor: it carries the full device block (the
+// diagnostic sensors reference it by shared identifier) and uses the LWT topic,
+// so HA greys every entity out together the moment the bridge dies. Returns the
+// publish packet-id (0 = send buffer full).
+static uint16_t publishBridgeConnectivity() {
     JsonDocument doc;
     doc["name"]         = nullptr;   // null -> HA shows it as the device's main
                                      // entity ("Watts WFHT Bridge"), no doubled name
@@ -1015,18 +1028,29 @@ static void publishDiscovery() {
     dev["model"]          = "ESP32+CC1101";
     String body;
     serializeJson(doc, body);
-    mqtt.publish("homeassistant/binary_sensor/watts_bridge/status/config",
-                 1, true, body.c_str());
-
-    publishSensorDiscovery("rssi",         "WiFi signal",       "rssi",
-                           "signal_strength", "dBm");
-    publishSensorDiscovery("uptime",       "Uptime",            "uptime",
-                           "duration", "s");
-    publishSensorDiscovery("reset_reason", "Reset reason",      "reset_reason",
-                           nullptr, nullptr);
-    publishSensorDiscovery("last_tx_age",  "Last transmit age", "last_tx_age",
-                           "duration", "s");
+    return mqtt.publish("homeassistant/binary_sensor/watts_bridge/status/config",
+                        1, true, body.c_str());
 }
+
+// The bridge's diagnostic sensors, all backed by the retained DIAG blob. A table
+// (rather than inline calls) so the paced re-advertise sequencer can index them.
+struct BridgeSensor { const char *object, *name, *valueKey, *devClass, *unit; };
+static const BridgeSensor BRIDGE_SENSORS[] = {
+    {"rssi",         "WiFi signal",       "rssi",         "signal_strength", "dBm"},
+    {"uptime",       "Uptime",            "uptime",       "duration",        "s"},
+    {"reset_reason", "Reset reason",      "reset_reason", nullptr,           nullptr},
+    {"last_tx_age",  "Last transmit age", "last_tx_age",  "duration",        "s"},
+};
+static const int BRIDGE_SENSOR_COUNT = sizeof(BRIDGE_SENSORS) / sizeof(BRIDGE_SENSORS[0]);
+
+// Publish one bridge config message by global step index: 0 = the connectivity
+// binary_sensor (carries the device block), 1.. = the diagnostic sensors.
+static uint16_t advertiseBridgeStep(int step) {
+    if (step == 0) return publishBridgeConnectivity();
+    const BridgeSensor &s = BRIDGE_SENSORS[step - 1];
+    return publishSensorDiscovery(s.object, s.name, s.valueKey, s.devClass, s.unit);
+}
+static const int BRIDGE_STEP_COUNT = 1 + BRIDGE_SENSOR_COUNT;
 
 // Per-bound-zone state -> HA. Each zone surfaces as its own HA device nested
 // under the bridge (via_device), carrying what the bridge is actually
@@ -1057,8 +1081,8 @@ static Thermostat *zoneThermostat(const ZoneBinding *b) {
 // status: pending (bound, no source data yet) / active (transmitting) / stale
 // (source went quiet, TX dropped by the failsafe). tx_* are the wire values the
 // next burst would carry.
-static void publishZoneState(const ZoneBinding *b) {
-    if (!mqtt.connected()) return;
+static uint16_t publishZoneState(const ZoneBinding *b) {
+    if (!mqtt.connected()) return 0;
     char slug[40];  zoneSlug(b->name, slug, sizeof(slug));
     char topic[64]; snprintf(topic, sizeof(topic), "watts-bridge/zone/%s", slug);
 
@@ -1082,14 +1106,14 @@ static void publishZoneState(const ZoneBinding *b) {
     }
     String body;
     serializeJson(doc, body);
-    mqtt.publish(topic, 1, true, body.c_str());
+    return mqtt.publish(topic, 1, true, body.c_str());
 }
 
 // One sensor's HA discovery config for a zone, sourced from the zone state blob.
-static void publishZoneSensor(const char *slug, const char *zoneName,
-                              const char *object, const char *label,
-                              const char *valueKey, const char *devClass,
-                              const char *unit, bool diagnostic) {
+static uint16_t publishZoneSensor(const char *slug, const char *zoneName,
+                                  const char *object, const char *label,
+                                  const char *valueKey, const char *devClass,
+                                  const char *unit, bool diagnostic) {
     JsonDocument doc;
     doc["name"] = label;
     char uid[64];
@@ -1120,30 +1144,33 @@ static void publishZoneSensor(const char *slug, const char *zoneName,
              "homeassistant/sensor/watts_zone_%s/%s/config", slug, object);
     String body;
     serializeJson(doc, body);
-    mqtt.publish(topic, 1, true, body.c_str());
+    return mqtt.publish(topic, 1, true, body.c_str());
 }
 
-// The fixed set of objects making up a zone's entities -- shared by publish and
-// clear so they can't drift apart.
-static const char *ZONE_OBJECTS[] = {
-    "status", "setpoint", "ambient", "mode", "tx_age", "watts_id"
+// The set of sensors making up a zone's HA device, backed by the retained zone
+// state blob. The single source of truth for publish (the re-advertise
+// sequencer), clear (on unbind), and the object list -- so they can't drift apart.
+struct ZoneSensor {
+    const char *object, *label, *valueKey, *devClass, *unit;
+    bool diagnostic;
 };
+static const ZoneSensor ZONE_SENSORS[] = {
+    {"status",   "Status",            "status",      nullptr,       nullptr, false},
+    {"setpoint", "Setpoint",          "tx_setpoint", "temperature", "°C",    false},
+    {"ambient",  "Ambient",           "tx_ambient",  "temperature", "°C",    false},
+    {"mode",     "Mode",              "mode",        nullptr,       nullptr, false},
+    {"tx_age",   "Last transmit age", "last_tx_age", "duration",    "s",     true},
+    {"watts_id", "Watts ID",          "watts_id",    nullptr,       nullptr, true},
+};
+static const int ZONE_SENSOR_COUNT = sizeof(ZONE_SENSORS) / sizeof(ZONE_SENSORS[0]);
 
-static void publishZoneDiscovery(const ZoneBinding *b) {
-    if (!mqtt.connected()) return;
+// Publish one of a zone's discovery configs by index. Returns the packet-id
+// (0 = send buffer full) so the sequencer knows whether it landed.
+static uint16_t advertiseZoneSensorStep(const ZoneBinding *b, int step) {
     char slug[40]; zoneSlug(b->name, slug, sizeof(slug));
-    publishZoneSensor(slug, b->name, "status",   "Status",            "status",
-                      nullptr, nullptr, false);
-    publishZoneSensor(slug, b->name, "setpoint", "Setpoint",          "tx_setpoint",
-                      "temperature", "°C", false);
-    publishZoneSensor(slug, b->name, "ambient",  "Ambient",           "tx_ambient",
-                      "temperature", "°C", false);
-    publishZoneSensor(slug, b->name, "mode",     "Mode",              "mode",
-                      nullptr, nullptr, false);
-    publishZoneSensor(slug, b->name, "tx_age",   "Last transmit age", "last_tx_age",
-                      "duration", "s", true);
-    publishZoneSensor(slug, b->name, "watts_id", "Watts ID",          "watts_id",
-                      nullptr, nullptr, true);
+    const ZoneSensor &s = ZONE_SENSORS[step];
+    return publishZoneSensor(slug, b->name, s.object, s.label, s.valueKey,
+                             s.devClass, s.unit, s.diagnostic);
 }
 
 // Remove a zone's entities from HA: an empty retained payload on each config
@@ -1152,28 +1179,78 @@ static void clearZoneDiscovery(const ZoneBinding *b) {
     if (!mqtt.connected()) return;
     char slug[40]; zoneSlug(b->name, slug, sizeof(slug));
     char topic[96];
-    for (const char *o : ZONE_OBJECTS) {
+    for (const ZoneSensor &s : ZONE_SENSORS) {
         snprintf(topic, sizeof(topic),
-                 "homeassistant/sensor/watts_zone_%s/%s/config", slug, o);
+                 "homeassistant/sensor/watts_zone_%s/%s/config", slug, s.object);
         mqtt.publish(topic, 1, true, "");
     }
     snprintf(topic, sizeof(topic), "watts-bridge/zone/%s", slug);
     mqtt.publish(topic, 1, true, "");
 }
 
-// (Re)advertise every bound zone and seed its state -- used on (re)connect.
-static void publishAllZones() {
-    for (int i = 0; i < MAX_THERMOSTATS; i++) {
-        if (!bindings[i].used) continue;
-        publishZoneDiscovery(&bindings[i]);
-        publishZoneState(&bindings[i]);
-    }
-}
-
 // Refresh just the state blobs (keeps last_tx_age moving) -- used on the heartbeat.
 static void publishAllZoneStates() {
     for (int i = 0; i < MAX_THERMOSTATS; i++)
         if (bindings[i].used) publishZoneState(&bindings[i]);
+}
+
+// ---------------------------------------------------------------------------
+// Paced re-advertise
+// ---------------------------------------------------------------------------
+// On (re)connect we must (re)publish ~7 retained configs per zone plus the
+// bridge's own -- 20+ messages for a few zones. Firing them all back-to-back in
+// the onConnect callback overran the AsyncTCP send buffer: AsyncMqttClient drops
+// the overflow (publish() returns packet-id 0) and, since publishAllZones ran
+// last, the later zones' entities never registered in HA -- visible as a zone
+// transmitting on-air (rtl_433 sees it) but stuck "stale" in HA. Instead we
+// publish ONE message per loop() tick and only advance the cursor when the broker
+// accepted it (pid != 0); a 0 holds the cursor and retries next tick, so the
+// burst self-paces to the socket's drain rate and nothing is silently lost.
+enum AdvPhase : uint8_t { ADV_IDLE, ADV_BRIDGE, ADV_DIAG, ADV_ZONES, ADV_DONE };
+static AdvPhase advPhase     = ADV_IDLE;
+static int      advBridgeStep = 0;   // 0..BRIDGE_STEP_COUNT-1
+static int      advZoneIdx    = 0;   // index into bindings[]
+static int      advZoneStep   = 0;   // 0..ZONE_SENSOR_COUNT  (last = state blob)
+
+// Request a full paced (re)advertise from the start. Cheap: just rewinds the
+// cursor; loop()'s serviceAdvertise() does the work. Safe to call mid-advertise.
+static void startAdvertise() {
+    advPhase      = ADV_BRIDGE;
+    advBridgeStep = 0;
+    advZoneIdx    = 0;
+    advZoneStep   = 0;
+}
+
+// Publish at most one pending retained config per call. Drained from loop().
+static void serviceAdvertise() {
+    if (advPhase == ADV_IDLE || advPhase == ADV_DONE) return;
+    if (!mqtt.connected()) { advPhase = ADV_IDLE; return; }   // reconnect re-arms it
+
+    switch (advPhase) {
+        case ADV_BRIDGE:
+            if (advertiseBridgeStep(advBridgeStep))
+                if (++advBridgeStep >= BRIDGE_STEP_COUNT) advPhase = ADV_DIAG;
+            return;
+        case ADV_DIAG:
+            if (publishDiag()) { lastDiagAt = millis(); advPhase = ADV_ZONES; }
+            return;
+        case ADV_ZONES:
+            while (advZoneIdx < MAX_THERMOSTATS && !bindings[advZoneIdx].used)
+                advZoneIdx++;
+            if (advZoneIdx >= MAX_THERMOSTATS) { advPhase = ADV_DONE; return; }
+            if (advZoneStep < ZONE_SENSOR_COUNT) {
+                if (advertiseZoneSensorStep(&bindings[advZoneIdx], advZoneStep))
+                    advZoneStep++;
+            } else {                              // last step: seed the state blob
+                if (publishZoneState(&bindings[advZoneIdx])) {
+                    advZoneStep = 0;
+                    advZoneIdx++;
+                }
+            }
+            return;
+        default:
+            return;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,15 +1270,13 @@ static void initMqtt() {
     mqtt.onConnect([](bool sessionPresent) {
         Serial.printf("MQTT: connected to %s:%d\n", MQTT_HOST, MQTT_PORT);
         mqttRetryAt = 0;
-        // Overwrite the LWT's stale "offline" from any prior death, advertise the
-        // entities, and seed a first health blob so HA isn't blank until the timer.
+        // Overwrite the LWT's stale "offline" from any prior death immediately,
+        // then kick off a paced re-advertise of the bridge + every bound zone's
+        // retained configs (restored from NVS before connect). Pacing is essential:
+        // firing them all here overran the send buffer and silently dropped the
+        // later zones -- see serviceAdvertise(). loop() drains it one msg per tick.
         mqtt.publish(AVAIL_TOPIC, 1, true, "online");
-        publishDiscovery();
-        publishDiag();
-        lastDiagAt = millis();
-        // Re-advertise every bound zone (restored from NVS before connect) so its
-        // HA entities reappear and re-seed if the broker dropped its retained set.
-        publishAllZones();
+        startAdvertise();
         // Subscribe to the retained Z2M inventory; the broker delivers it at once.
         uint16_t pid = mqtt.subscribe(Z2M_DEVICES_TOPIC, 0);
         Serial.printf("MQTT: subscribed to %s (pid %u)\n", Z2M_DEVICES_TOPIC, pid);
@@ -1321,8 +1396,9 @@ static void setupRoutes() {
         b->dirty    = true;                             // transmit asap
         b->stale    = false;
         saveBindings();                                 // persist to NVS
-        publishZoneDiscovery(b);                        // create the HA entities
-        publishZoneState(b);
+        startAdvertise();                               // paced (re)advertise so the
+                                                        // new zone's HA entities land
+                                                        // without overrunning the buffer
         char resp[96];
         snprintf(resp, sizeof(resp), "bound \"%s\" -> %02X%02X%02X",
                  b->name, id[0], id[1], id[2]);
@@ -1489,6 +1565,11 @@ void loop() {
             mqttRetryAt = millis() + 5000;   // wait for WiFi to come back
         }
     }
+
+    // Drain the paced retained-config (re)advertise: one message per tick, only
+    // advancing when the broker accepted it, so the connect-time burst can't
+    // overrun the send buffer and silently drop a zone's HA entities.
+    serviceAdvertise();
 
     // RX decode: drain timed edges into a per-burst chip stream, then on the
     // long idle gap that delimits a frame, Manchester-decode + CRC-check it. A
