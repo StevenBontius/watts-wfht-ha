@@ -33,11 +33,15 @@ pio device monitor         # serial @ 115200
 
 The firmware is MQTT-driven: it subscribes to Z2M thermostat state and transmits
 per bound zone on the 154 s heartbeat (or on change), with RX, pairing capture,
-and NVS-persisted bindings. The HTTP server remains as the operational/debug
-control surface (not yet gated behind a build flag): `GET /status`, `/tx-test`,
-`/tx-watts`, `/tx-pair` (accepts `id=` to pair a bound zone's device ID into the
-receiver), `/tx-pair-status`, `/rx-on`, `/rx-off`, `/pair-listen`, `/pair-status`,
-`/pair-cancel`, `/bind`, `/unbind`, `/bindings`. `MANCHESTER_ONE_IS_10` in
+and NVS-persisted bindings. The HTTP server is the operational config surface:
+`/tx-pair` (accepts `id=` to pair a bound zone's device ID into the receiver),
+`/tx-pair-status`, `/pair-listen`, `/pair-status`, `/pair-cancel`, `/bind`,
+`/unbind`, `/bindings`, `/thermostats`, plus the served binding/pairing web page
+at `/` and `/reset-wifi`. The unauthenticated debug/test endpoints (`/status`,
+`/tx-test`, `/tx-watts`, `/rx-on`, `/rx-off`) are gated behind the `DEBUG_HTTP`
+build flag (default 0; set to 1 in `config.h` for radio bring-up). The on-device
+web UI is the kept config surface; HA-native config is deferred (ROADMAP M4).
+`MANCHESTER_ONE_IS_10` in
 `src/main.cpp` is the one physical-layer polarity knob — flip it if rtl_433 is
 silent or reports bit-inverted CRC failures.
 

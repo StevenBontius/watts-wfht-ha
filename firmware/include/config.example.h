@@ -28,3 +28,10 @@
 #define MQTT_USER      ""               // "" = anonymous
 #define MQTT_PASSWORD  ""
 #define MQTT_CLIENT_ID "watts-bridge"
+
+// Debug/test HTTP endpoints. When 1, exposes the unauthenticated /status,
+// /rx-on, /rx-off, /tx-test and /tx-watts endpoints -- handy for radio
+// bring-up, but any host on the LAN can then key the PA / actuate heating.
+// Leave at 0 for production. The captive portal and binding/pairing UI are
+// always served regardless of this flag.
+#define DEBUG_HTTP 0

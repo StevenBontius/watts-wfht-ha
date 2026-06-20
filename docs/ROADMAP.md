@@ -96,8 +96,11 @@ receiver that actuates on call-for-heat.
       ID** button that arms `/pair-listen` and auto-fills the Watts ID when a
       thermostat is switched off. Drives the existing `/bind` / `/unbind` /
       `/pair-*` endpoints; kept separate from the TX test surface below.
-- [ ] **Retire / gate the HTTP test endpoints** behind a debug build flag
-      (the `/tx-*` / `/rx-*` debug surface — not the binding UI / config endpoints)
+- [x] **Gate the HTTP test endpoints** behind the `DEBUG_HTTP` build flag
+      (default 0; gates `/status`, `/tx-test`, `/tx-watts`, `/rx-on`, `/rx-off` —
+      not the binding UI / config endpoints, and not `/tx-pair`, which the
+      pairing UI uses). The on-device binding/pairing web UI is kept as the
+      config surface; HA-native config (M4) is deferred, not a replacement.
 - [x] **Field test against the real Watts receiver (one zone)** — confirmed on
       hardware: the full HA → MQTT → ESP32 → CC1101 → receiver path drives the
       real Watts receiver and actuates the zone end-to-end

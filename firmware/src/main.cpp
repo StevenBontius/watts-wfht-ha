@@ -106,6 +106,15 @@
 // when you need to inspect frames the decoder rejects.
 #define RX_DEBUG 0
 
+// Unauthenticated debug/test HTTP endpoints (/status, /rx-on, /rx-off,
+// /tx-test, /tx-watts). These can key the PA and actuate heating from any
+// host on the LAN, so they default OFF for production. Define DEBUG_HTTP to 1
+// in config.h to expose them while bringing up the radio. The captive portal
+// and the binding/pairing UI are always served regardless of this flag.
+#ifndef DEBUG_HTTP
+#define DEBUG_HTTP 0
+#endif
+
 // Reported to HA on the diagnostics blob so you know what's actually flashed
 // without a serial console. Bump on each flash you care to distinguish.
 #define FW_VERSION "m3-dev"
@@ -1665,6 +1674,7 @@ static void setupRoutes() {
         portalRebootAt = millis() + 1500;   // deferred restart, handled in loop()
     });
 
+#if DEBUG_HTTP
     server.on("/status", HTTP_GET, [](AsyncWebServerRequest *req) {
         JsonDocument doc;
         doc["ip"]   = WiFi.localIP().toString();
@@ -1692,6 +1702,7 @@ static void setupRoutes() {
         rxDisable();
         req->send(200, "text/plain", "rx off");
     });
+#endif  // DEBUG_HTTP
 
     // Off-frame pairing capture. Arm, then switch a thermostat off: the first
     // CRC-valid setpoint-0.0 frame latches its device ID. Auto-enables RX.
@@ -1818,6 +1829,7 @@ static void setupRoutes() {
         req->send(200, "application/json", body);
     });
 
+#if DEBUG_HTTP
     // Raw lead-in burst, a quick "is the PA keying" smoke test.
     server.on("/tx-test", HTTP_GET, [](AsyncWebServerRequest *req) {
         uint8_t buf[16];
@@ -1854,6 +1866,7 @@ static void setupRoutes() {
         Serial.println(resp);
         req->send(200, "text/plain", resp);
     });
+#endif  // DEBUG_HTTP
 
     // Send pairing frames at ~2 Hz for `duration` seconds (default 10, max 120).
     // Byte 12 has bit 0 set (pairing) plus the heat/cool bit from `mode`.
