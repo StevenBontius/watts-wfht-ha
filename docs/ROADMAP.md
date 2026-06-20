@@ -165,6 +165,15 @@ Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 - [ ] **MQTT discovery entities** — expose status + lock per zone without cluttering
       the climate dashboard
 - [ ] Document the HA/MQTT topic contract
+- [ ] _(nice-to-have)_ **OTA firmware update** — flash over WiFi instead of USB.
+      Natural fit: the ESP already owns WiFi + `ESPAsyncWebServer`, so an
+      ElegantOTA-style `/update` page slots onto the existing web UI config surface
+      (matches [[web-ui-vs-ha-native-config]]). Gates: must sit behind the existing
+      HTTP digest auth (an unauthenticated flash endpoint is a LAN-wide foothold);
+      needs a dual-app OTA partition table (`board_build.partitions` — check flash
+      headroom first); an update blocks the radio for a few seconds, harmless against
+      the 154 s heartbeat. First OTA-capable build still goes over USB; subsequent
+      flashes go over the air.
 
 ## Testing & validation (cross-cutting)
 
