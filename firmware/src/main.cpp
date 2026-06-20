@@ -16,7 +16,9 @@
  * and reflash. That is the only physical-layer ambiguity left.
  *
  * Endpoints:
+ *   GET /                                        binding config web UI (browser)
  *   GET /status                                  radio + config info
+ *   GET /thermostats                             discovered Z2M thermostats (JSON)
  *   GET /rx-on  /rx-off                          listen for + decode Watts frames
  *   GET /pair-listen                             arm off-frame device-ID capture
  *   GET /pair-status                             poll capture result (JSON)
@@ -1308,7 +1310,120 @@ static bool parseHexId(const String &s, uint8_t out[3]) {
     return true;
 }
 
+// Self-contained binding-config UI served at GET /. No external assets (the ESP
+// isn't internet-facing for a CDN) -- it just drives the JSON endpoints already
+// here: /thermostats, /bindings, /pair-listen, /pair-status, /bind, /unbind.
+// The pairing flow auto-fills the Watts ID so binding needs no typing.
+static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Watts WFHT Bridge</title>
+<style>
+ :root{color-scheme:dark light}
+ body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:1.2rem;max-width:760px}
+ h1{font-size:1.3rem;margin:0 0 .2rem}
+ .sub{color:#888;margin:0 0 1.2rem;font-size:.85rem}
+ section{border:1px solid #8884;border-radius:8px;padding:1rem;margin-bottom:1.2rem}
+ h2{font-size:1rem;margin:0 0 .8rem}
+ table{width:100%;border-collapse:collapse;font-size:.9rem}
+ th,td{text-align:left;padding:.4rem .5rem;border-bottom:1px solid #8883}
+ th{color:#888;font-weight:600}
+ .id{font-family:ui-monospace,monospace}
+ .badge{font-size:.72rem;padding:.1rem .45rem;border-radius:10px;background:#2e7d32;color:#fff}
+ .badge.stale{background:#c62828}
+ label{display:block;font-size:.8rem;color:#888;margin:.6rem 0 .2rem}
+ select,input{font:inherit;padding:.45rem;width:100%;box-sizing:border-box;
+   border:1px solid #8886;border-radius:6px;background:transparent;color:inherit}
+ .row{display:flex;gap:.8rem;flex-wrap:wrap}
+ .row>div{flex:1;min-width:160px}
+ button{font:inherit;padding:.5rem .9rem;border:0;border-radius:6px;cursor:pointer;
+   background:#1976d2;color:#fff;margin-top:.9rem}
+ button.sec{background:#5557}
+ button.danger{background:#b3261e;padding:.3rem .6rem;margin:0;font-size:.8rem}
+ #msg{min-height:1.2rem;font-size:.85rem;margin-top:.6rem}
+ .ok{color:#2e7d32}.err{color:#c62828}.muted{color:#888}
+</style></head><body>
+<h1>Watts WFHT Bridge</h1>
+<p class="sub">Bind a Home Assistant / Z2M thermostat to a Watts device ID.</p>
+
+<section>
+ <h2>Current bindings</h2>
+ <table><thead><tr><th>Thermostat</th><th>Watts ID</th><th>Temp</th>
+   <th>Set</th><th>Mode</th><th>TX age</th><th></th></tr></thead>
+ <tbody id="rows"><tr><td colspan="7" class="muted">loading…</td></tr></tbody></table>
+</section>
+
+<section>
+ <h2>Add / update binding</h2>
+ <div class="row">
+  <div><label>Thermostat</label><select id="name"></select></div>
+  <div><label>Watts device ID (6 hex)</label>
+   <input id="id" placeholder="349E48" maxlength="6" autocapitalize="characters"></div>
+ </div>
+ <button class="sec" id="cap">Capture ID from thermostat</button>
+ <button id="bind">Bind</button>
+ <div id="msg"></div>
+</section>
+
+<script>
+const $=s=>document.querySelector(s);
+function msg(t,c){const m=$("#msg");m.textContent=t;m.className=c||"";}
+async function jget(u){const r=await fetch(u);if(!r.ok)throw new Error(await r.text());
+  return r.headers.get("content-type")?.includes("json")?r.json():r.text();}
+
+function age(s){return s<0?"—":s<120?s+"s":Math.round(s/60)+"m";}
+async function loadBindings(){
+ try{const b=await jget("/bindings");
+  $("#rows").innerHTML=b.length?b.map(z=>`<tr>
+   <td>${z.name}</td><td class="id">${z.id}</td>
+   <td>${z.temp??"—"}</td><td>${z.setpoint??"—"}</td><td>${z.mode??"—"}</td>
+   <td>${age(z.last_tx_age_s)} ${z.stale?'<span class="badge stale">stale</span>':''}</td>
+   <td><button class="danger" onclick="unbind('${z.name}')">Unbind</button></td>
+   </tr>`).join(""):'<tr><td colspan="7" class="muted">no bindings yet</td></tr>';
+ }catch(e){$("#rows").innerHTML=`<tr><td colspan="7" class="err">${e.message}</td></tr>`;}
+}
+async function loadThermostats(){
+ try{const t=await jget("/thermostats");const sel=$("#name");const cur=sel.value;
+  sel.innerHTML=t.length?t.map(x=>`<option value="${x.name}">${x.name}${x.bound?" (bound)":""}</option>`).join("")
+    :'<option value="">none discovered yet</option>';
+  if(cur)sel.value=cur;
+ }catch(e){msg(e.message,"err");}
+}
+async function unbind(name){
+ try{await jget("/unbind?name="+encodeURIComponent(name));msg("Unbound "+name,"ok");
+  refresh();}catch(e){msg(e.message,"err");}
+}
+$("#bind").onclick=async()=>{
+ const name=$("#name").value, id=$("#id").value.trim().toUpperCase();
+ if(!name)return msg("pick a thermostat","err");
+ if(!/^[0-9A-F]{6}$/.test(id))return msg("ID must be 6 hex digits","err");
+ try{const r=await jget(`/bind?name=${encodeURIComponent(name)}&id=${id}`);
+  msg(r,"ok");$("#id").value="";refresh();}catch(e){msg(e.message,"err");}
+};
+let capTimer=null;
+$("#cap").onclick=async()=>{
+ if(capTimer){clearInterval(capTimer);capTimer=null;await jget("/pair-cancel");
+  $("#cap").textContent="Capture ID from thermostat";msg("capture cancelled","muted");return;}
+ try{await jget("/pair-listen");}catch(e){return msg(e.message,"err");}
+ $("#cap").textContent="Cancel — switch a thermostat OFF…";
+ msg("listening — set the Watts thermostat to OFF to capture its ID","muted");
+ capTimer=setInterval(async()=>{
+  try{const s=await jget("/pair-status");
+   if(s.captured){clearInterval(capTimer);capTimer=null;
+    $("#id").value=s.id;$("#cap").textContent="Capture ID from thermostat";
+    msg("captured "+s.id+" — review the thermostat then Bind","ok");}
+  }catch(e){clearInterval(capTimer);capTimer=null;msg(e.message,"err");}
+ },1000);
+};
+function refresh(){loadBindings();loadThermostats();}
+refresh();setInterval(loadBindings,5000);
+</script></body></html>)HTML";
+
 static void setupRoutes() {
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "text/html", INDEX_HTML);
+    });
+
     server.on("/status", HTTP_GET, [](AsyncWebServerRequest *req) {
         JsonDocument doc;
         doc["ip"]   = WiFi.localIP().toString();
@@ -1441,6 +1556,21 @@ static void setupRoutes() {
                 if (thermostats[j].lastMode[0])      o["mode"] = thermostats[j].lastMode;
                 break;
             }
+        }
+        String body;
+        serializeJson(doc, body);
+        req->send(200, "application/json", body);
+    });
+
+    // Discovered Z2M thermostats (the inventory the web UI's dropdown reads).
+    // Distinct from /bindings, which lists only zones already tied to a Watts ID.
+    server.on("/thermostats", HTTP_GET, [](AsyncWebServerRequest *req) {
+        JsonDocument doc;
+        JsonArray    arr = doc.to<JsonArray>();
+        for (int i = 0; i < thermostatCount; i++) {
+            JsonObject o = arr.add<JsonObject>();
+            o["name"]  = thermostats[i].name;
+            o["bound"] = findBinding(thermostats[i].name) != nullptr;
         }
         String body;
         serializeJson(doc, body);

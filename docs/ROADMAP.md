@@ -89,7 +89,15 @@ receiver that actuates on call-for-heat.
       on every TX, on a source change/recovery, and on the stale-drop transition,
       with a 30 s heartbeat refresh to keep `last_tx_age` moving. Shares the bridge
       LWT for availability, so a dead bridge greys every zone out too.
+- [x] **Binding config web UI** — a self-contained page served at `GET /`
+      (no external/CDN assets) makes binding a no-typing browser task: it lists
+      current bindings with live state + an Unbind button, offers a dropdown of
+      discovered thermostats (new `GET /thermostats` endpoint), and a **Capture
+      ID** button that arms `/pair-listen` and auto-fills the Watts ID when a
+      thermostat is switched off. Drives the existing `/bind` / `/unbind` /
+      `/pair-*` endpoints; kept separate from the TX test surface below.
 - [ ] **Retire / gate the HTTP test endpoints** behind a debug build flag
+      (the `/tx-*` / `/rx-*` debug surface — not the binding UI / config endpoints)
 - [x] **Field test against the real Watts receiver (one zone)** — confirmed on
       hardware: the full HA → MQTT → ESP32 → CC1101 → receiver path drives the
       real Watts receiver and actuates the zone end-to-end
