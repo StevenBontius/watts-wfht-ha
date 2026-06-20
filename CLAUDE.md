@@ -35,7 +35,8 @@ The firmware is MQTT-driven: it subscribes to Z2M thermostat state and transmits
 per bound zone on the 154 s heartbeat (or on change), with RX, pairing capture,
 and NVS-persisted bindings. The HTTP server remains as the operational/debug
 control surface (not yet gated behind a build flag): `GET /status`, `/tx-test`,
-`/tx-watts`, `/tx-pair`, `/rx-on`, `/rx-off`, `/pair-listen`, `/pair-status`,
+`/tx-watts`, `/tx-pair` (accepts `id=` to pair a bound zone's device ID into the
+receiver), `/tx-pair-status`, `/rx-on`, `/rx-off`, `/pair-listen`, `/pair-status`,
 `/pair-cancel`, `/bind`, `/unbind`, `/bindings`. `MANCHESTER_ONE_IS_10` in
 `src/main.cpp` is the one physical-layer polarity knob — flip it if rtl_433 is
 silent or reports bit-inverted CRC failures.

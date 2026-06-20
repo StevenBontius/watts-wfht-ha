@@ -31,8 +31,10 @@
  *   GET /bindings                                list bindings + live state (JSON)
  *   GET /tx-test                                 raw OOK smoke test
  *   GET /tx-watts?amb=22.5&sp=24.0&cfh=0&mode=heat   send a Watts A-B-A burst
- *   GET /tx-pair?duration=30&mode=heat           send pairing frames at 2 Hz
- *                                                (blocks for `duration` s)
+ *   GET /tx-pair?duration=30&mode=heat&id=349E48 send pairing frames at 2 Hz
+ *                                                (id defaults to DEV_ID; the web
+ *                                                 UI passes a bound zone's ID)
+ *   GET /tx-pair-status                          poll pairing progress (JSON)
  *
  * Copyright (C) 2026. GPLv2 or later.
  */
@@ -401,6 +403,7 @@ struct PairJob {
     float    amb      = 0.0f;
     float    sp        = 0.0f;
     uint8_t  mode     = 0x03;    // heat + pairing
+    uint8_t  devId[3] = {DEV_ID[0], DEV_ID[1], DEV_ID[2]};  // ID the receiver learns
 };
 static PairJob pairJob;
 
@@ -1526,7 +1529,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
  button{font:inherit;padding:.5rem .9rem;border:0;border-radius:6px;cursor:pointer;
    background:#1976d2;color:#fff;margin-top:.9rem}
  button.sec{background:#5557}
+ button.sm{padding:.3rem .6rem;margin:0 .3rem 0 0;font-size:.8rem}
  button.danger{background:#b3261e;padding:.3rem .6rem;margin:0;font-size:.8rem}
+ button:disabled{opacity:.5;cursor:default}
  #msg{min-height:1.2rem;font-size:.85rem;margin-top:.6rem}
  .ok{color:#2e7d32}.err{color:#c62828}.muted{color:#888}
 </style></head><body>
@@ -1572,7 +1577,9 @@ async function loadBindings(){
    <td>${z.name}</td><td class="id">${z.id}</td>
    <td>${z.temp??"—"}</td><td>${z.setpoint??"—"}</td><td>${z.mode??"—"}</td>
    <td>${age(z.last_tx_age_s)} ${z.stale?'<span class="badge stale">stale</span>':''}</td>
-   <td><button class="danger" onclick="unbind('${z.name}')">Unbind</button></td>
+   <td style="white-space:nowrap">
+     <button class="sec sm" onclick="pair('${z.id}',${z.temp??'null'},${z.setpoint??'null'})">Pair</button>
+     <button class="danger" onclick="unbind('${z.name}')">Unbind</button></td>
    </tr>`).join(""):'<tr><td colspan="7" class="muted">no bindings yet</td></tr>';
  }catch(e){$("#rows").innerHTML=`<tr><td colspan="7" class="err">${e.message}</td></tr>`;}
 }
@@ -1586,6 +1593,27 @@ async function loadThermostats(){
 async function unbind(name){
  try{await jget("/unbind?name="+encodeURIComponent(name));msg("Unbound "+name,"ok");
   refresh();}catch(e){msg(e.message,"err");}
+}
+let pairTimer=null;
+async function pair(id,amb,sp){
+ if(pairTimer)return; // a pairing run is already streaming
+ if(!confirm("Put the Watts receiver zone into pairing/learn mode first, then OK.\n\n"
+   +"The bridge will transmit pairing frames for "+id+" for 30 s."))return;
+ let q="/tx-pair?id="+id+"&duration=30";        // carry the zone's live values so the
+ if(amb!=null)q+="&amb="+amb;                    // receiver learns a sane frame, not 0/0
+ if(sp!=null)q+="&sp="+sp;
+ try{await jget(q);}catch(e){return msg(e.message,"err");}
+ document.querySelectorAll("button").forEach(b=>b.disabled=true);
+ pairTimer=setInterval(async()=>{
+  try{const s=await jget("/tx-pair-status");
+   if(s.active){msg("pairing "+s.id+" — "+s.remaining_s+"s left","muted");}
+   else{clearInterval(pairTimer);pairTimer=null;
+    document.querySelectorAll("button").forEach(b=>b.disabled=false);
+    msg("pairing frames sent for "+id+" — check the receiver","ok");}
+  }catch(e){clearInterval(pairTimer);pairTimer=null;
+   document.querySelectorAll("button").forEach(b=>b.disabled=false);
+   msg(e.message,"err");}
+ },1000);
 }
 $("#bind").onclick=async()=>{
  const name=$("#name").value, id=$("#id").value.trim().toUpperCase();
@@ -1605,7 +1633,8 @@ $("#cap").onclick=async()=>{
   try{const s=await jget("/pair-status");
    if(s.captured){clearInterval(capTimer);capTimer=null;
     $("#id").value=s.id;$("#cap").textContent="Capture ID from thermostat";
-    msg("captured "+s.id+" — review the thermostat then Bind","ok");}
+    const t=(s.amb!=null&&!isNaN(s.amb))?` (reads ${s.amb} °C — check it matches the room)`:"";
+    msg("captured "+s.id+t+" — select the correct thermostat then Bind","ok");}
   }catch(e){clearInterval(capTimer);capTimer=null;msg(e.message,"err");}
  },1000);
 };
@@ -1616,7 +1645,7 @@ async function resetWifi(){
  }catch(e){msg(e.message,"err");}
 }
 function refresh(){loadBindings();loadThermostats();}
-refresh();setInterval(loadBindings,5000);
+refresh();setInterval(()=>{if(!pairTimer)loadBindings();},5000);
 </script></body></html>)HTML";
 
 static void setupRoutes() {
@@ -1845,6 +1874,16 @@ static void setupRoutes() {
         if (req->hasParam("amb")) amb = req->getParam("amb")->value().toFloat();
         if (req->hasParam("sp"))  sp  = req->getParam("sp")->value().toFloat();
 
+        // Which device ID the receiver should learn. Defaults to the firmware
+        // DEV_ID; the web UI passes a bound zone's ID so the receiver associates
+        // that manifold valve with the bridge's spoof of that ID.
+        uint8_t id[3] = {DEV_ID[0], DEV_ID[1], DEV_ID[2]};
+        if (req->hasParam("id") &&
+            !parseHexId(req->getParam("id")->value(), id)) {
+            req->send(400, "text/plain", "id must be 6 hex digits, e.g. 349E48");
+            return;
+        }
+
         uint8_t pair_mode = mode_base | 0x01;   // set pairing bit
         int frames = duration * 2;              // 2 Hz for `duration` seconds
 
@@ -1858,13 +1897,32 @@ static void setupRoutes() {
         pairJob.amb     = amb;
         pairJob.sp      = sp;
         pairJob.mode    = pair_mode;
+        memcpy(pairJob.devId, id, 3);
 
-        char resp[96];
+        char resp[112];
         snprintf(resp, sizeof(resp),
-                 "pairing started: %d frames over %ds, mode=0x%02x",
-                 frames, duration, pair_mode);
+                 "pairing started: %d frames over %ds, id=%02X%02X%02X, mode=0x%02x",
+                 frames, duration, id[0], id[1], id[2], pair_mode);
         Serial.println(resp);
         req->send(200, "text/plain", resp);
+    });
+    // Progress poll for the web UI's pairing button. The pairing stream runs in
+    // loop(); the page polls this to show a countdown and to re-enable the button.
+    server.on("/tx-pair-status", HTTP_GET, [](AsyncWebServerRequest *req) {
+        JsonDocument doc;
+        doc["active"] = pairJob.active;
+        doc["sent"]   = pairJob.sent;
+        doc["total"]  = pairJob.total;
+        int left = pairJob.active && pairJob.total > pairJob.sent
+                       ? (pairJob.total - pairJob.sent) / 2 : 0;
+        doc["remaining_s"] = left;
+        char id[7];
+        snprintf(id, sizeof(id), "%02X%02X%02X",
+                 pairJob.devId[0], pairJob.devId[1], pairJob.devId[2]);
+        doc["id"] = id;
+        String body;
+        serializeJson(doc, body);
+        req->send(200, "application/json", body);
     });
 
     server.onNotFound([](AsyncWebServerRequest *req) {
@@ -2017,7 +2075,7 @@ void loop() {
     // sp (A) / sp+0.1 (B), until `total` frames have gone out.
     if (pairJob.active && (int32_t)(millis() - pairJob.next_at) >= 0) {
         bool isB = pairJob.sent & 1;
-        sendFrameOnce(DEV_ID, pairJob.amb, isB ? pairJob.sp + 0.1f : pairJob.sp,
+        sendFrameOnce(pairJob.devId, pairJob.amb, isB ? pairJob.sp + 0.1f : pairJob.sp,
                       0x00, pairJob.mode);
         pairJob.sent++;
         if (pairJob.sent >= pairJob.total) {
