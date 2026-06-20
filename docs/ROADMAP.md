@@ -90,7 +90,9 @@ receiver that actuates on call-for-heat.
       with a 30 s heartbeat refresh to keep `last_tx_age` moving. Shares the bridge
       LWT for availability, so a dead bridge greys every zone out too.
 - [ ] **Retire / gate the HTTP test endpoints** behind a debug build flag
-- [ ] Field test against the real Watts receiver (one zone)
+- [x] **Field test against the real Watts receiver (one zone)** — confirmed on
+      hardware: the full HA → MQTT → ESP32 → CC1101 → receiver path drives the
+      real Watts receiver and actuates the zone end-to-end
 
 ## M2 — RX path + pairing capture ✅ (done)
 
@@ -154,7 +156,8 @@ regressions and the failure modes that hardware testing doesn't exercise.
 - [x] Control model — Python emulator validated against an overnight capture (`tools/wfht_emulator.py`)
 
 **Per-milestone validation to add:**
-- [ ] **M1** — field test one zone against the real receiver (already listed in M1)
+- [x] **M1** — field test one zone against the real receiver: confirmed
+      end-to-end on hardware (HA → MQTT → ESP32 → CC1101 → receiver actuates)
 - [ ] **M1** — failsafe test: stall MQTT updates, confirm the stale-data timeout
       forces idle (0x00) — a path hardware "happy path" testing never hits
 - [ ] **M1** — MQTT resilience: kill/restart the broker and WiFi, confirm reconnect

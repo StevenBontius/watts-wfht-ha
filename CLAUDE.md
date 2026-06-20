@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-This is a reverse-engineering and firmware project to replace Watts WFHT-RF legacy underfloor heating thermostats with a headless Home Assistant bridge (ESP32 + CC1101). Phase 1 (RF protocol characterization) is complete. The firmware is a **standalone Arduino / PlatformIO app** (`firmware/`) — not ESPHome; the ESP owns WiFi, MQTT, the control loop, the NVS device registry and HA discovery itself. Today it is an HTTP-driven TX proof of concept; the path to the full bridge is tracked in `docs/ROADMAP.md`.
+This is a reverse-engineering and firmware project to replace Watts WFHT-RF legacy underfloor heating thermostats with a headless Home Assistant bridge (ESP32 + CC1101). Phase 1 (RF protocol characterization) is complete. The firmware is a **standalone Arduino / PlatformIO app** (`firmware/`) — not ESPHome; the ESP owns WiFi, MQTT, the control loop, the NVS device registry and HA discovery itself. The single-zone live bridge is confirmed on real hardware — the full HA → MQTT → ESP32 → CC1101 → receiver path actuates the real Watts receiver end-to-end. RX/pairing-capture and persisted multi-zone bindings are implemented; remaining work (simultaneous five-zone validation, failsafe/resilience tests, headless HA UX) is tracked in `docs/ROADMAP.md`.
 
 ## Running the emulator
 
@@ -31,10 +31,14 @@ pio run -t upload          # build + flash ESP32 over USB
 pio device monitor         # serial @ 115200
 ```
 
-Current firmware is an HTTP-driven TX proof of concept (single hard-coded device
-ID, no MQTT, no RX). Control surface: `GET /status`, `/tx-test`, `/tx-watts`,
-`/tx-pair`. `MANCHESTER_ONE_IS_10` in `src/main.cpp` is the one physical-layer
-polarity knob — flip it if rtl_433 is silent or reports bit-inverted CRC failures.
+The firmware is MQTT-driven: it subscribes to Z2M thermostat state and transmits
+per bound zone on the 154 s heartbeat (or on change), with RX, pairing capture,
+and NVS-persisted bindings. The HTTP server remains as the operational/debug
+control surface (not yet gated behind a build flag): `GET /status`, `/tx-test`,
+`/tx-watts`, `/tx-pair`, `/rx-on`, `/rx-off`, `/pair-listen`, `/pair-status`,
+`/pair-cancel`, `/bind`, `/unbind`, `/bindings`. `MANCHESTER_ONE_IS_10` in
+`src/main.cpp` is the one physical-layer polarity knob — flip it if rtl_433 is
+silent or reports bit-inverted CRC failures.
 
 ## Architecture
 

@@ -4,7 +4,11 @@ Replacing Watts WFHT-RF legacy underfloor heating thermostats with a headless Ho
 
 By intercepting the proprietary RF layer of existing HVAC installations, this bridge modernizes disconnected hydronic underfloor heating (UFH) systems without requiring an expensive mechanical overhaul of the manifold, valves, or pumps.
 
-**Status:** Phase 1 Capture and protocol characterization complete.
+**Status:** Single-zone live bridge confirmed on hardware — the full
+HA → MQTT → ESP32 → CC1101 → receiver path drives the real Watts receiver and
+actuates a zone end-to-end. (Phase 1 RF capture & protocol characterization
+complete.) Remaining: simultaneous five-zone validation, failsafe/resilience
+tests, and headless HA UX — see [`docs/ROADMAP.md`](/docs/ROADMAP.md).
 
 [Watts WFHT RF Protocol Reverse Engineering](/docs/WATTS_WFHT_RF_PROTOCOL.md)
 
