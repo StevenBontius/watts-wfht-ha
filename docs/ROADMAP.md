@@ -147,6 +147,15 @@ Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 
 ## M4 — Home Assistant UX (headless)
 
+- [x] **Captive-portal provisioning** — WiFi + MQTT creds moved out of compile-time
+      `config.h` into NVS (`NetConfig`), so the device is field-provisionable without
+      a reflash. On boot with no SSID (or a 20 s STA-connect timeout) it comes up as
+      an open AP `watts-bridge-XXXX` with a DNS catch-all, serving a setup form;
+      `POST /save` persists to NVS and reboots into STA. `config.h` macros are now
+      first-boot *seed* defaults only (loaded to RAM, not persisted) — editable by
+      reflash only while NVS is empty; once the portal saves, NVS is authoritative.
+      `GET /reset-wifi` (and a button on the binding UI) clears creds and reboots
+      into the portal. Password fields have a show/hide toggle.
 - [ ] **Per-zone parental lock** toggle — gate W100 local button input on/off
 - [ ] **MQTT discovery entities** — expose status + lock per zone without cluttering
       the climate dashboard

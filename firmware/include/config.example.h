@@ -2,6 +2,15 @@
 
 // Copy this file to config.h and fill in your values.
 // config.h is gitignored.
+//
+// NOTE: WiFi + MQTT values below are only SEED defaults, used while NVS holds no
+// saved config. They are loaded into RAM each boot but NOT persisted -- so while
+// NVS is empty (a fresh device or after a flash erase) you can edit these macros
+// and reflash to change the running config. The moment the captive portal saves
+// (POST /save), NVS becomes authoritative and these macros are ignored on boot;
+// merely connecting with the seeds does NOT persist them. /reset-wifi then opens
+// the portal (it does not fall back to these macros) -- only a full NVS/flash
+// erase restores seeding from here. Leave WIFI_SSID blank to force the portal.
 
 #define WIFI_SSID     "your-ssid"
 #define WIFI_PASSWORD "your-password"

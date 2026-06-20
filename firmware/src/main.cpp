@@ -17,6 +17,9 @@
  *
  * Endpoints:
  *   GET /                                        binding config web UI (browser)
+ *                                                (setup portal form when unprovisioned)
+ *   GET /reset-wifi                              clear net config, reboot into portal
+ *   POST /save                                   portal: save WiFi+MQTT, reboot (AP mode)
  *   GET /status                                  radio + config info
  *   GET /thermostats                             discovered Z2M thermostats (JSON)
  *   GET /rx-on  /rx-off                          listen for + decode Watts frames
@@ -73,6 +76,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <DNSServer.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
@@ -302,6 +306,68 @@ static void loadBindings() {
         }
     }
     Serial.printf("NVS: loaded %d binding(s)\n", n);
+}
+
+// ---------------------------------------------------------------------------
+// Network config (WiFi + MQTT) -- runtime-provisioned via the captive portal
+// ---------------------------------------------------------------------------
+// Stored in NVS (same namespace as bindings, separate key + version) so the
+// device is field-provisionable without a recompile. config.h still defines the
+// macros below, but they now act only as first-boot seed defaults: once the
+// portal writes a config, NVS is authoritative and config.h is ignored. An empty
+// wifiSsid is the signal to open the portal on boot.
+struct NetConfig {
+    char     wifiSsid[33];
+    char     wifiPass[65];
+    char     mqttHost[64];
+    uint16_t mqttPort;
+    char     mqttUser[33];
+    char     mqttPass[65];
+    char     mqttClientId[33];
+};
+static NetConfig      netCfg;
+static const uint32_t NET_VER = 1;
+
+static void saveNetConfig() {
+    prefs.begin(NVS_NS, false);
+    prefs.putUInt("netver", NET_VER);
+    prefs.putBytes("netcfg", &netCfg, sizeof(netCfg));
+    prefs.end();
+}
+
+static void loadNetConfig() {
+    bool ok = false;
+    prefs.begin(NVS_NS, true);   // read-only
+    if (prefs.getUInt("netver", 0) == NET_VER &&
+        prefs.getBytesLength("netcfg") == sizeof(netCfg)) {
+        prefs.getBytes("netcfg", &netCfg, sizeof(netCfg));
+        ok = true;
+    }
+    prefs.end();
+    if (!ok) {
+        // First boot (or layout change): seed from compile-time config.h.
+        memset(&netCfg, 0, sizeof(netCfg));
+        strlcpy(netCfg.wifiSsid,     WIFI_SSID,      sizeof(netCfg.wifiSsid));
+        strlcpy(netCfg.wifiPass,     WIFI_PASSWORD,  sizeof(netCfg.wifiPass));
+        strlcpy(netCfg.mqttHost,     MQTT_HOST,      sizeof(netCfg.mqttHost));
+        netCfg.mqttPort = MQTT_PORT;
+        strlcpy(netCfg.mqttUser,     MQTT_USER,      sizeof(netCfg.mqttUser));
+        strlcpy(netCfg.mqttPass,     MQTT_PASSWORD,  sizeof(netCfg.mqttPass));
+        strlcpy(netCfg.mqttClientId, MQTT_CLIENT_ID, sizeof(netCfg.mqttClientId));
+        Serial.println("NVS: no net config -- seeded from config.h defaults");
+    } else {
+        Serial.printf("NVS: net config loaded (ssid=\"%s\" mqtt=%s:%u)\n",
+                      netCfg.wifiSsid, netCfg.mqttHost, netCfg.mqttPort);
+    }
+}
+
+// /reset-wifi: persist an empty config (valid version, blank SSID) so the next
+// boot loads it cleanly and opens the portal -- rather than removing the key,
+// which would just reseed from config.h and silently reconnect to the old net.
+static void clearNetConfig() {
+    memset(&netCfg, 0, sizeof(netCfg));
+    netCfg.mqttPort = MQTT_PORT;
+    saveNetConfig();
 }
 
 // Steady-state transmit cadence: mirror a real thermostat's 154 s heartbeat, and
@@ -1262,15 +1328,18 @@ static void serviceAdvertise() {
 // arrives on a callback. We report over Serial in the same shape as the CC1101
 // init ("MQTT: ..."). On a disconnect we arm a one-shot retry in loop().
 static void initMqtt() {
-    mqtt.setServer(MQTT_HOST, MQTT_PORT);
-    mqtt.setClientId(MQTT_CLIENT_ID);
+    // Settings come from runtime NetConfig (NVS), not the config.h macros --
+    // AsyncMqttClient stores the pointers, so netCfg's static buffers must outlive
+    // the connection (they're file-scope globals, so they do).
+    mqtt.setServer(netCfg.mqttHost, netCfg.mqttPort);
+    mqtt.setClientId(netCfg.mqttClientId);
     // LWT: the broker publishes "offline" (retained) if we drop ungracefully.
     mqtt.setWill(AVAIL_TOPIC, 1, true, "offline");
-    if (strlen(MQTT_USER) > 0)
-        mqtt.setCredentials(MQTT_USER, MQTT_PASSWORD);
+    if (strlen(netCfg.mqttUser) > 0)
+        mqtt.setCredentials(netCfg.mqttUser, netCfg.mqttPass);
 
     mqtt.onConnect([](bool sessionPresent) {
-        Serial.printf("MQTT: connected to %s:%d\n", MQTT_HOST, MQTT_PORT);
+        Serial.printf("MQTT: connected to %s:%u\n", netCfg.mqttHost, netCfg.mqttPort);
         mqttRetryAt = 0;
         // Overwrite the LWT's stale "offline" from any prior death immediately,
         // then kick off a paced re-advertise of the bridge + every bound zone's
@@ -1289,7 +1358,7 @@ static void initMqtt() {
     });
     mqtt.onMessage(onMqttMessage);
 
-    Serial.printf("MQTT: connecting to %s:%d\n", MQTT_HOST, MQTT_PORT);
+    Serial.printf("MQTT: connecting to %s:%u\n", netCfg.mqttHost, netCfg.mqttPort);
     mqtt.connect();
 }
 
@@ -1308,6 +1377,124 @@ static bool parseHexId(const String &s, uint8_t out[3]) {
         out[i] = (uint8_t)v;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Captive portal (first-boot / no-creds WiFi + MQTT provisioning)
+// ---------------------------------------------------------------------------
+// When there are no usable WiFi creds (empty SSID) or STA association times out,
+// the device comes up as its own open AP with a DNS catch-all so any phone/laptop
+// that joins is bounced to a setup form. Saving writes NetConfig to NVS and the
+// device reboots into normal STA mode. Reuses the one AsyncWebServer; portal and
+// normal routes are mutually exclusive (setup() returns early into one or other).
+static DNSServer dnsServer;
+static bool      portalActive  = false;
+static uint32_t  portalRebootAt = 0;   // deferred restart so the HTTP reply flushes
+
+static const char PORTAL_HTML[] PROGMEM = R"HTML(<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Watts Bridge setup</title>
+<style>
+ :root{color-scheme:dark light}
+ body{font:15px/1.5 system-ui,sans-serif;margin:0;padding:1.2rem;max-width:480px}
+ h1{font-size:1.3rem;margin:0 0 .2rem}
+ .sub{color:#888;margin:0 0 1.2rem;font-size:.85rem}
+ fieldset{border:1px solid #8884;border-radius:8px;padding:1rem;margin:0 0 1.2rem}
+ legend{color:#888;font-size:.8rem;padding:0 .4rem}
+ label{display:block;font-size:.8rem;color:#888;margin:.6rem 0 .2rem}
+ input{font:inherit;padding:.5rem;width:100%;box-sizing:border-box;
+   border:1px solid #8886;border-radius:6px;background:transparent;color:inherit}
+ button{font:inherit;padding:.6rem 1rem;border:0;border-radius:6px;cursor:pointer;
+   background:#1976d2;color:#fff;width:100%}
+ .row{display:flex;gap:.8rem}.row>div{flex:1}
+ .pw{position:relative}
+ .pw input{padding-right:2.6rem}
+ .pw button{position:absolute;right:.2rem;top:50%;transform:translateY(-50%);
+   width:auto;background:none;color:#888;padding:.3rem;display:flex}
+ .pw button svg{width:18px;height:18px;display:block}
+</style></head><body>
+<h1>Watts Bridge setup</h1>
+<p class="sub">Connect this bridge to your WiFi and MQTT broker.</p>
+<form method="post" action="/save">
+ <fieldset><legend>WiFi</legend>
+  <label>Network (SSID)</label><input name="ssid" required autofocus>
+  <label>Password</label>
+  <div class="pw"><input name="pass" type="password">
+   <button type="button" onclick="tog(this)" aria-label="Show password"></button></div>
+ </fieldset>
+ <fieldset><legend>MQTT broker</legend>
+  <div class="row">
+   <div><label>Host</label><input name="mhost" placeholder="192.168.1.10"></div>
+   <div style="flex:0 0 90px"><label>Port</label><input name="mport" value="1883"></div>
+  </div>
+  <label>Username (blank = anonymous)</label><input name="muser">
+  <label>Password</label>
+  <div class="pw"><input name="mpass" type="password">
+   <button type="button" onclick="tog(this)" aria-label="Show password"></button></div>
+ </fieldset>
+ <button type="submit">Save &amp; reboot</button>
+</form>
+<script>
+const EYE='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYEOFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+document.querySelectorAll(".pw button").forEach(b=>b.innerHTML=EYE);
+function tog(b){const i=b.previousElementSibling;const s=i.type==="password";
+ i.type=s?"text":"password";b.innerHTML=s?EYEOFF:EYE;}
+</script>
+</body></html>)HTML";
+
+static void setupPortalRoutes() {
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
+        req->send(200, "text/html", PORTAL_HTML);
+    });
+    server.on("/save", HTTP_POST, [](AsyncWebServerRequest *req) {
+        auto field = [&](const char *k) -> String {
+            return req->hasParam(k, true) ? req->getParam(k, true)->value() : String();
+        };
+        String ssid = field("ssid");
+        if (ssid.isEmpty()) { req->send(400, "text/plain", "ssid required"); return; }
+
+        memset(&netCfg, 0, sizeof(netCfg));
+        strlcpy(netCfg.wifiSsid, ssid.c_str(),          sizeof(netCfg.wifiSsid));
+        strlcpy(netCfg.wifiPass, field("pass").c_str(), sizeof(netCfg.wifiPass));
+        strlcpy(netCfg.mqttHost, field("mhost").c_str(),sizeof(netCfg.mqttHost));
+        int mp = field("mport").toInt();
+        netCfg.mqttPort = (mp > 0 && mp <= 65535) ? (uint16_t)mp : 1883;
+        strlcpy(netCfg.mqttUser, field("muser").c_str(),sizeof(netCfg.mqttUser));
+        strlcpy(netCfg.mqttPass, field("mpass").c_str(),sizeof(netCfg.mqttPass));
+        strlcpy(netCfg.mqttClientId, MQTT_CLIENT_ID,    sizeof(netCfg.mqttClientId));
+        saveNetConfig();
+        Serial.printf("PORTAL: saved ssid=\"%s\" mqtt=%s:%u -- rebooting\n",
+                      netCfg.wifiSsid, netCfg.mqttHost, netCfg.mqttPort);
+
+        String body = "<!doctype html><meta charset=utf-8>"
+                      "<meta http-equiv=refresh content='10;url=/'>"
+                      "<body style=\"font:15px system-ui;padding:1.2rem\">"
+                      "Saved. Rebooting and connecting to <b>" + ssid + "</b>…<br>"
+                      "If it can't join, the setup AP will reappear.</body>";
+        req->send(200, "text/html", body);
+        portalRebootAt = millis() + 1500;   // let the reply flush, then restart in loop()
+    });
+    // Captive-portal probes (and anything else): bounce to the form so the OS
+    // pops its "sign in to network" sheet instead of reporting no internet.
+    server.onNotFound([](AsyncWebServerRequest *req) {
+        req->redirect("/");
+    });
+}
+
+static void startPortal() {
+    portalActive = true;
+    WiFi.mode(WIFI_AP);
+    char ap[32];
+    snprintf(ap, sizeof(ap), "watts-bridge-%04X",
+             (uint16_t)(ESP.getEfuseMac() >> 32));
+    WiFi.softAP(ap);
+    IPAddress ip = WiFi.softAPIP();
+    dnsServer.start(53, "*", ip);   // catch-all so every lookup resolves to us
+    setupPortalRoutes();
+    server.begin();
+    Serial.printf("PORTAL: open AP \"%s\" -> http://%s/\n", ap, ip.toString().c_str());
 }
 
 // Self-contained binding-config UI served at GET /. No external assets (the ESP
@@ -1365,6 +1552,13 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
  <div id="msg"></div>
 </section>
 
+<section>
+ <h2>Device</h2>
+ <button class="danger" onclick="resetWifi()">Reset WiFi / MQTT setup</button>
+ <p class="muted" style="font-size:.8rem;margin:.6rem 0 0">Clears stored network
+  config and reboots into the setup portal (join WiFi <span class="id">watts-bridge-…</span>).</p>
+</section>
+
 <script>
 const $=s=>document.querySelector(s);
 function msg(t,c){const m=$("#msg");m.textContent=t;m.className=c||"";}
@@ -1415,6 +1609,12 @@ $("#cap").onclick=async()=>{
   }catch(e){clearInterval(capTimer);capTimer=null;msg(e.message,"err");}
  },1000);
 };
+async function resetWifi(){
+ if(!confirm("Clear WiFi + MQTT config and reboot into the setup portal?"))return;
+ try{await fetch("/reset-wifi");
+  msg("rebooting into setup portal — reconnect to the watts-bridge-… WiFi","muted");
+ }catch(e){msg(e.message,"err");}
+}
 function refresh(){loadBindings();loadThermostats();}
 refresh();setInterval(loadBindings,5000);
 </script></body></html>)HTML";
@@ -1422,6 +1622,18 @@ refresh();setInterval(loadBindings,5000);
 static void setupRoutes() {
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
         req->send(200, "text/html", INDEX_HTML);
+    });
+
+    // Clear stored WiFi/MQTT config and reboot into the captive setup portal.
+    server.on("/reset-wifi", HTTP_GET, [](AsyncWebServerRequest *req) {
+        clearNetConfig();
+        Serial.println("RESET: net config cleared -- rebooting into portal");
+        req->send(200, "text/html",
+                  "<!doctype html><meta charset=utf-8>"
+                  "<body style=\"font:15px system-ui;padding:1.2rem\">"
+                  "Network config cleared. Rebooting into the setup portal "
+                  "(join WiFi <b>watts-bridge-…</b>).</body>");
+        portalRebootAt = millis() + 1500;   // deferred restart, handled in loop()
     });
 
     server.on("/status", HTTP_GET, [](AsyncWebServerRequest *req) {
@@ -1667,12 +1879,28 @@ void setup() {
     // the diagnostics blob (distinguishes a clean OTA from a brownout/watchdog).
     resetReasonStr = resetReasonName(esp_reset_reason());
 
+    loadNetConfig();
+
+    // No SSID provisioned yet -> straight to the captive portal.
+    if (netCfg.wifiSsid[0] == '\0') {
+        Serial.println("WiFi: no SSID configured -- starting setup portal");
+        startPortal();
+        return;
+    }
+
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.print("WiFi connecting");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
+    WiFi.begin(netCfg.wifiSsid, netCfg.wifiPass);
+    Serial.printf("WiFi connecting to \"%s\"", netCfg.wifiSsid);
+    uint32_t startedAt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 20000) {
+        delay(250);
         Serial.print(".");
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        // Bad creds or AP gone -> fall back to the portal so it can be re-provisioned.
+        Serial.println("\nWiFi: connect timed out -- starting setup portal");
+        startPortal();
+        return;
     }
     Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
 
@@ -1685,6 +1913,18 @@ void setup() {
 }
 
 void loop() {
+    // Deferred restart (portal save / /reset-wifi): fire once the HTTP reply has
+    // had time to flush. Checked in both portal and normal modes.
+    if (portalRebootAt != 0 && (int32_t)(millis() - portalRebootAt) >= 0)
+        ESP.restart();
+
+    // Captive-portal mode: just service DNS so probes resolve to us; none of the
+    // MQTT / radio / scheduler machinery runs until we're provisioned and rebooted.
+    if (portalActive) {
+        dnsServer.processNextRequest();
+        return;
+    }
+
     // One-shot MQTT reconnect: re-arm a connect attempt after a drop.
     if (mqttRetryAt != 0 && (int32_t)(millis() - mqttRetryAt) >= 0) {
         mqttRetryAt = 0;
