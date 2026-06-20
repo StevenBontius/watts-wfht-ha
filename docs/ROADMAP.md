@@ -35,9 +35,10 @@ and runs the master in Comfort mode (HA is the sole scheduler). The P-loop /
 duty→cfh items below are **back-burnered** — kept only for a hypothetical dumb
 receiver that actuates on call-for-heat.
 
-- [~] **MQTT client** — `AsyncMqttClient` wired up: connect + non-blocking 5 s
+- [x] **MQTT client** — `AsyncMqttClient` wired up: connect + non-blocking 5 s
       reconnect done (authenticates against HA users; broker settings in `config.h`).
-      LWT still to add.
+      LWT in place: `watts-bridge/status` carries `online`/`offline`, registered as
+      a retained will so the broker announces an ungraceful death on our behalf.
 - [x] **Characterize Z2M output for the W100** — field reference documented in
       `docs/MQTT_W100.md` from the Z2M device definition (model TH-S04D):
       `temperature` → T, `occupied_heating_setpoint` → SP, `system_mode` → heat/cool/off.
@@ -69,7 +70,25 @@ receiver that actuates on call-for-heat.
 - [ ] _(back burner — nice-to-have)_ **Map duty → call-for-heat flag**
       (0x00 / 0x64) on the cycle boundary — only meaningful if the P-loop runs;
       cfh is otherwise transmitted as a constant benign 0x00
-- [ ] **Publish state** back to MQTT (current cfh, duty, last-tx age) for observability
+- [x] **Bridge observability** — retained `watts-bridge/diag` JSON blob
+      republished every 30 s (`rssi`, `uptime`, `reset_reason`, `last_tx_age`,
+      `ip`, `fw`), seeded on connect. Self-announcing HA MQTT-discovery configs
+      (`homeassistant/.../watts_bridge/*`): a `connectivity` binary_sensor on the
+      LWT topic plus diagnostic sensors for the blob fields, all sharing the
+      `watts-bridge/status` availability so HA greys them out together. `last_tx_age`
+      is the radio-health tell — crossing ~160 s while still `online` means the
+      radio is wedged though MQTT/WiFi are fine (the bridge-side mirror of the
+      stale-data failsafe). Discovery is republished on every reconnect (idempotent,
+      re-seeds if the broker drops its retained set).
+- [x] **Per-zone state + HA entities** — each bound zone surfaces as its own HA
+      device (nested under the bridge via `via_device`) from a retained
+      `watts-bridge/zone/<slug>` blob: `status` (pending/active/stale), transmitted
+      `setpoint` + `ambient`, `mode`, `last_tx_age`, and the spoofed `watts_id`.
+      Discovery is published on `/bind` and re-advertised on every (re)connect;
+      `/unbind` clears it (empty retained config → entity removed). State is pushed
+      on every TX, on a source change/recovery, and on the stale-drop transition,
+      with a 30 s heartbeat refresh to keep `last_tx_age` moving. Shares the bridge
+      LWT for availability, so a dead bridge greys every zone out too.
 - [ ] **Retire / gate the HTTP test endpoints** behind a debug build flag
 - [ ] Field test against the real Watts receiver (one zone)
 
@@ -140,6 +159,9 @@ regressions and the failure modes that hardware testing doesn't exercise.
       forces idle (0x00) — a path hardware "happy path" testing never hits
 - [ ] **M1** — MQTT resilience: kill/restart the broker and WiFi, confirm reconnect
       and that the loop keeps running on last-known values
+- [ ] **M1** — LWT/availability: pull power (not a clean disconnect), confirm the
+      broker publishes `offline` on `watts-bridge/status` and HA marks the device
+      unavailable; on reboot confirm `online` + a fresh `diag` blob + `reset_reason`
 - [ ] **M2** — RX loopback: encode → decode roundtrip in firmware; assert recovered
       bytes + CRCs match the source frame
 - [ ] **M3** — registry persistence: write channels to NVS, reboot, confirm they reload

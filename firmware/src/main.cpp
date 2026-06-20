@@ -77,6 +77,7 @@
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <AsyncMqttClient.h>
 #include <Preferences.h>
+#include <esp_system.h>
 #include <math.h>
 #include <string.h>
 #include "config.h"
@@ -96,6 +97,10 @@
 // When 0, only CRC-valid frames and PAIR events are printed. Set to 1 + reflash
 // when you need to inspect frames the decoder rejects.
 #define RX_DEBUG 0
+
+// Reported to HA on the diagnostics blob so you know what's actually flashed
+// without a serial console. Bump on each flash you care to distinguish.
+#define FW_VERSION "m3-dev"
 
 // Device ID cloned from captures (frame bytes 13..15).
 static const uint8_t DEV_ID[3] = {0x34, 0x9E, 0x48};
@@ -250,6 +255,11 @@ static ZoneBinding *findBinding(const char *name) {
             return &bindings[i];
     return nullptr;
 }
+
+// Per-zone HA state publishing lives with the MQTT layer further down, but the
+// scheduler and the Z2M message handler (both above it) trigger it on every TX
+// and on a source change/recovery -- so it's forward-declared here.
+static void publishZoneState(const ZoneBinding *b);
 
 // NVS persistence for bindings. The whole array is stored as one blob, guarded by
 // a version key so a future ZoneBinding layout change ignores stale data rather
@@ -645,6 +655,7 @@ static void serviceScheduler() {
                     Serial.printf("zone \"%s\": source stale (%lus) -- dropping TX; "
                                   "receiver will flag lost thermostat\n",
                                   t.name, (unsigned long)((now - t.lastUpdateMs) / 1000));
+                    publishZoneState(b);   // reflect the drop in HA immediately
                 }
                 continue;
             }
@@ -666,6 +677,7 @@ static void serviceScheduler() {
     Serial.printf("TX zone \"%s\": id=%02X%02X%02X amb=%.1f sp=%.1f mode=0x%02X\n",
                   zt->name, zb->devId[0], zb->devId[1], zb->devId[2],
                   zt->lastTemp, sp, mode);
+    publishZoneState(zb);   // reflect the just-sent values in HA
 }
 
 // ---------------------------------------------------------------------------
@@ -840,6 +852,8 @@ static void handleStateMessage(const char *topic, const char *payload, size_t le
     if (b && b->stale) {
         b->stale = false;
         Serial.printf("zone \"%s\": source recovered -- resuming TX\n", t->name);
+        publishZoneState(b);   // a recovery on an idle (unchanged) report still
+                               // matters -- surface it before the early-return below
     }
 
     float temp = doc[t->tempField] | NAN;
@@ -861,8 +875,10 @@ static void handleStateMessage(const char *topic, const char *payload, size_t le
     if (!changed) return;   // redundant republish (e.g. humidity-only) -- ignore
 
     // A real change on a bound zone means the receiver needs the new values now,
-    // not at the next 154 s heartbeat -- flag it for the scheduler.
-    if (b) b->dirty = true;
+    // not at the next 154 s heartbeat -- flag it for the scheduler. Also push the
+    // new source values to HA right away (the burst follows within MIN_BURST_GAP,
+    // but the state blob shouldn't wait on the radio).
+    if (b) { b->dirty = true; publishZoneState(b); }
 
     char tbuf[8], sbuf[8];
     if (isnan(t->lastTemp)) strcpy(tbuf, "--"); else snprintf(tbuf, sizeof(tbuf), "%.1f", t->lastTemp);
@@ -902,6 +918,265 @@ static void onMqttMessage(char *topic, char *payload,
 }
 
 // ---------------------------------------------------------------------------
+// Bridge observability over MQTT
+// ---------------------------------------------------------------------------
+// Two topics, both retained:
+//   AVAIL_TOPIC -- online/offline liveness. We publish "online" on connect and
+//     register "offline" as the LWT, so the broker announces an ungraceful death
+//     (brownout, WiFi drop, crash) on our behalf -- exactly when we can't.
+//   DIAG_TOPIC  -- a single JSON blob of bridge health, republished every
+//     DIAG_PERIOD_MS. One publish backs many HA sensors via value_template, and
+//     being retained it survives a reconnect.
+static const char *AVAIL_TOPIC = "watts-bridge/status";
+static const char *DIAG_TOPIC  = "watts-bridge/diag";
+static const uint32_t DIAG_PERIOD_MS = 30000;
+static uint32_t       lastDiagAt     = 0;
+static const char    *resetReasonStr = "unknown";   // latched once at boot
+
+static const char *resetReasonName(esp_reset_reason_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:   return "power-on";
+        case ESP_RST_SW:        return "sw-reset";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "int-wdt";
+        case ESP_RST_TASK_WDT:  return "task-wdt";
+        case ESP_RST_WDT:       return "wdt";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_DEEPSLEEP: return "deepsleep";
+        case ESP_RST_EXT:       return "ext";
+        default:                return "unknown";
+    }
+}
+
+// Publish the current health blob. last_tx_age is the domain-specific field: -1
+// until the first burst, then seconds since lastBurstAt -- crossing ~160 s while
+// "online" still holds means the radio is wedged though MQTT/WiFi are fine.
+static void publishDiag() {
+    JsonDocument doc;
+    doc["rssi"]         = WiFi.RSSI();
+    doc["uptime"]       = millis() / 1000;           // wraps at ~49 days; fine here
+    doc["reset_reason"] = resetReasonStr;
+    doc["last_tx_age"]  = lastBurstAt ? (int32_t)((millis() - lastBurstAt) / 1000)
+                                      : -1;
+    doc["ip"]           = WiFi.localIP().toString();
+    doc["fw"]           = FW_VERSION;
+    String body;
+    serializeJson(doc, body);
+    mqtt.publish(DIAG_TOPIC, 1, true, body.c_str());
+}
+
+// One diagnostic sensor's HA discovery config, sourced from the DIAG blob.
+static void publishSensorDiscovery(const char *object, const char *name,
+                                   const char *valueKey, const char *devClass,
+                                   const char *unit) {
+    JsonDocument doc;
+    doc["name"] = name;
+    char uid[48];
+    snprintf(uid, sizeof(uid), "watts_bridge_%s", object);
+    doc["unique_id"]   = uid;
+    doc["state_topic"] = DIAG_TOPIC;
+    char tmpl[48];
+    snprintf(tmpl, sizeof(tmpl), "{{ value_json.%s }}", valueKey);
+    doc["value_template"] = tmpl;
+    if (devClass) doc["device_class"]        = devClass;
+    if (unit)     doc["unit_of_measurement"] = unit;
+    doc["entity_category"]       = "diagnostic";
+    doc["availability_topic"]    = AVAIL_TOPIC;
+    doc["payload_available"]     = "online";
+    doc["payload_not_available"] = "offline";
+    doc["device"]["identifiers"][0] = "watts_bridge";
+    char topic[80];
+    snprintf(topic, sizeof(topic),
+             "homeassistant/sensor/watts_bridge/%s/config", object);
+    String body;
+    serializeJson(doc, body);
+    mqtt.publish(topic, 1, true, body.c_str());
+}
+
+// Retained HA MQTT-discovery configs. Republished on every (re)connect on
+// purpose: idempotent, and it re-seeds the entities if the broker dropped its
+// retained set. The connectivity binary_sensor carries the full device block
+// (the sensors reference it by shared identifier) and uses the LWT topic, so HA
+// greys every entity out together the moment the bridge dies.
+static void publishDiscovery() {
+    JsonDocument doc;
+    doc["name"]         = nullptr;   // null -> HA shows it as the device's main
+                                     // entity ("Watts WFHT Bridge"), no doubled name
+    doc["unique_id"]    = "watts_bridge_status";
+    doc["device_class"] = "connectivity";
+    doc["state_topic"]  = AVAIL_TOPIC;
+    doc["payload_on"]   = "online";
+    doc["payload_off"]  = "offline";
+    doc["entity_category"] = "diagnostic";
+    JsonObject dev = doc["device"].to<JsonObject>();
+    dev["identifiers"][0] = "watts_bridge";
+    dev["name"]           = "Watts WFHT Bridge";
+    dev["manufacturer"]   = "DIY";
+    dev["model"]          = "ESP32+CC1101";
+    String body;
+    serializeJson(doc, body);
+    mqtt.publish("homeassistant/binary_sensor/watts_bridge/status/config",
+                 1, true, body.c_str());
+
+    publishSensorDiscovery("rssi",         "WiFi signal",       "rssi",
+                           "signal_strength", "dBm");
+    publishSensorDiscovery("uptime",       "Uptime",            "uptime",
+                           "duration", "s");
+    publishSensorDiscovery("reset_reason", "Reset reason",      "reset_reason",
+                           nullptr, nullptr);
+    publishSensorDiscovery("last_tx_age",  "Last transmit age", "last_tx_age",
+                           "duration", "s");
+}
+
+// Per-bound-zone state -> HA. Each zone surfaces as its own HA device nested
+// under the bridge (via_device), carrying what the bridge is actually
+// transmitting to the Watts receiver for that zone -- distinct from the W100's
+// own HA entity, which shows the source. State is a retained per-zone JSON blob;
+// discovery is (re)published on bind and on (re)connect, and cleared on unbind
+// so the entities disappear from HA cleanly.
+
+// friendly_name -> a topic/object-id-safe slug (lowercase alnum + underscore).
+static void zoneSlug(const char *name, char *out, size_t n) {
+    size_t j = 0;
+    for (size_t i = 0; name[i] && j + 1 < n; i++) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        out[j++] = ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) ? c : '_';
+    }
+    out[j] = 0;
+}
+
+// The discovered thermostat backing a binding (NULL until Z2M first reports it).
+static Thermostat *zoneThermostat(const ZoneBinding *b) {
+    for (int i = 0; i < thermostatCount; i++)
+        if (strcmp(thermostats[i].name, b->name) == 0) return &thermostats[i];
+    return nullptr;
+}
+
+// Publish (retained) what the bridge is transmitting for one zone + its health.
+// status: pending (bound, no source data yet) / active (transmitting) / stale
+// (source went quiet, TX dropped by the failsafe). tx_* are the wire values the
+// next burst would carry.
+static void publishZoneState(const ZoneBinding *b) {
+    if (!mqtt.connected()) return;
+    char slug[40];  zoneSlug(b->name, slug, sizeof(slug));
+    char topic[64]; snprintf(topic, sizeof(topic), "watts-bridge/zone/%s", slug);
+
+    JsonDocument doc;
+    char id[7];
+    snprintf(id, sizeof(id), "%02X%02X%02X", b->devId[0], b->devId[1], b->devId[2]);
+    doc["watts_id"]    = id;
+    doc["last_tx_age"] = b->lastTxAt ? (int32_t)((millis() - b->lastTxAt) / 1000) : -1;
+
+    Thermostat *t = zoneThermostat(b);
+    if (!t || isnan(t->lastTemp) || isnan(t->lastSp)) {
+        doc["status"] = "pending";
+        doc["mode"]   = "unknown";
+    } else {
+        float sp; uint8_t mode;
+        zoneTxValues(t, &sp, &mode);
+        doc["status"]      = b->stale ? "stale" : "active";
+        doc["tx_ambient"]  = t->lastTemp;
+        doc["tx_setpoint"] = sp;
+        doc["mode"]        = t->lastMode[0] ? t->lastMode : "heat";
+    }
+    String body;
+    serializeJson(doc, body);
+    mqtt.publish(topic, 1, true, body.c_str());
+}
+
+// One sensor's HA discovery config for a zone, sourced from the zone state blob.
+static void publishZoneSensor(const char *slug, const char *zoneName,
+                              const char *object, const char *label,
+                              const char *valueKey, const char *devClass,
+                              const char *unit, bool diagnostic) {
+    JsonDocument doc;
+    doc["name"] = label;
+    char uid[64];
+    snprintf(uid, sizeof(uid), "watts_zone_%s_%s", slug, object);
+    doc["unique_id"] = uid;
+    char st[64];
+    snprintf(st, sizeof(st), "watts-bridge/zone/%s", slug);
+    doc["state_topic"] = st;
+    char tmpl[48];
+    snprintf(tmpl, sizeof(tmpl), "{{ value_json.%s }}", valueKey);
+    doc["value_template"] = tmpl;
+    if (devClass) doc["device_class"]        = devClass;
+    if (unit)     doc["unit_of_measurement"] = unit;
+    if (diagnostic) doc["entity_category"]   = "diagnostic";
+    doc["availability_topic"]    = AVAIL_TOPIC;
+    doc["payload_available"]     = "online";
+    doc["payload_not_available"] = "offline";
+    JsonObject dev = doc["device"].to<JsonObject>();
+    char devId[48];
+    snprintf(devId, sizeof(devId), "watts_zone_%s", slug);
+    dev["identifiers"][0] = devId;
+    char devName[80];
+    snprintf(devName, sizeof(devName), "Watts zone: %s", zoneName);
+    dev["name"]       = devName;
+    dev["via_device"] = "watts_bridge";   // nests this zone under the bridge device
+    char topic[96];
+    snprintf(topic, sizeof(topic),
+             "homeassistant/sensor/watts_zone_%s/%s/config", slug, object);
+    String body;
+    serializeJson(doc, body);
+    mqtt.publish(topic, 1, true, body.c_str());
+}
+
+// The fixed set of objects making up a zone's entities -- shared by publish and
+// clear so they can't drift apart.
+static const char *ZONE_OBJECTS[] = {
+    "status", "setpoint", "ambient", "mode", "tx_age", "watts_id"
+};
+
+static void publishZoneDiscovery(const ZoneBinding *b) {
+    if (!mqtt.connected()) return;
+    char slug[40]; zoneSlug(b->name, slug, sizeof(slug));
+    publishZoneSensor(slug, b->name, "status",   "Status",            "status",
+                      nullptr, nullptr, false);
+    publishZoneSensor(slug, b->name, "setpoint", "Setpoint",          "tx_setpoint",
+                      "temperature", "°C", false);
+    publishZoneSensor(slug, b->name, "ambient",  "Ambient",           "tx_ambient",
+                      "temperature", "°C", false);
+    publishZoneSensor(slug, b->name, "mode",     "Mode",              "mode",
+                      nullptr, nullptr, false);
+    publishZoneSensor(slug, b->name, "tx_age",   "Last transmit age", "last_tx_age",
+                      "duration", "s", true);
+    publishZoneSensor(slug, b->name, "watts_id", "Watts ID",          "watts_id",
+                      nullptr, nullptr, true);
+}
+
+// Remove a zone's entities from HA: an empty retained payload on each config
+// topic deletes the entity, and we clear the retained state blob too.
+static void clearZoneDiscovery(const ZoneBinding *b) {
+    if (!mqtt.connected()) return;
+    char slug[40]; zoneSlug(b->name, slug, sizeof(slug));
+    char topic[96];
+    for (const char *o : ZONE_OBJECTS) {
+        snprintf(topic, sizeof(topic),
+                 "homeassistant/sensor/watts_zone_%s/%s/config", slug, o);
+        mqtt.publish(topic, 1, true, "");
+    }
+    snprintf(topic, sizeof(topic), "watts-bridge/zone/%s", slug);
+    mqtt.publish(topic, 1, true, "");
+}
+
+// (Re)advertise every bound zone and seed its state -- used on (re)connect.
+static void publishAllZones() {
+    for (int i = 0; i < MAX_THERMOSTATS; i++) {
+        if (!bindings[i].used) continue;
+        publishZoneDiscovery(&bindings[i]);
+        publishZoneState(&bindings[i]);
+    }
+}
+
+// Refresh just the state blobs (keeps last_tx_age moving) -- used on the heartbeat.
+static void publishAllZoneStates() {
+    for (int i = 0; i < MAX_THERMOSTATS; i++)
+        if (bindings[i].used) publishZoneState(&bindings[i]);
+}
+
+// ---------------------------------------------------------------------------
 // MQTT init (connect + subscribe to the Z2M inventory for discovery)
 // ---------------------------------------------------------------------------
 // AsyncMqttClient is non-blocking: connect() returns immediately and the result
@@ -910,12 +1185,23 @@ static void onMqttMessage(char *topic, char *payload,
 static void initMqtt() {
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     mqtt.setClientId(MQTT_CLIENT_ID);
+    // LWT: the broker publishes "offline" (retained) if we drop ungracefully.
+    mqtt.setWill(AVAIL_TOPIC, 1, true, "offline");
     if (strlen(MQTT_USER) > 0)
         mqtt.setCredentials(MQTT_USER, MQTT_PASSWORD);
 
     mqtt.onConnect([](bool sessionPresent) {
         Serial.printf("MQTT: connected to %s:%d\n", MQTT_HOST, MQTT_PORT);
         mqttRetryAt = 0;
+        // Overwrite the LWT's stale "offline" from any prior death, advertise the
+        // entities, and seed a first health blob so HA isn't blank until the timer.
+        mqtt.publish(AVAIL_TOPIC, 1, true, "online");
+        publishDiscovery();
+        publishDiag();
+        lastDiagAt = millis();
+        // Re-advertise every bound zone (restored from NVS before connect) so its
+        // HA entities reappear and re-seed if the broker dropped its retained set.
+        publishAllZones();
         // Subscribe to the retained Z2M inventory; the broker delivers it at once.
         uint16_t pid = mqtt.subscribe(Z2M_DEVICES_TOPIC, 0);
         Serial.printf("MQTT: subscribed to %s (pid %u)\n", Z2M_DEVICES_TOPIC, pid);
@@ -1035,6 +1321,8 @@ static void setupRoutes() {
         b->dirty    = true;                             // transmit asap
         b->stale    = false;
         saveBindings();                                 // persist to NVS
+        publishZoneDiscovery(b);                        // create the HA entities
+        publishZoneState(b);
         char resp[96];
         snprintf(resp, sizeof(resp), "bound \"%s\" -> %02X%02X%02X",
                  b->name, id[0], id[1], id[2]);
@@ -1048,6 +1336,7 @@ static void setupRoutes() {
         }
         ZoneBinding *b = findBinding(req->getParam("name")->value().c_str());
         if (!b) { req->send(404, "text/plain", "no such binding"); return; }
+        clearZoneDiscovery(b);                          // remove the HA entities
         b->used = false;
         saveBindings();                                 // persist to NVS
         Serial.printf("unbound \"%s\"\n", b->name);
@@ -1168,6 +1457,10 @@ static void setupRoutes() {
 void setup() {
     Serial.begin(115200);
 
+    // Latch why we last rebooted before anything else can mask it; reported in
+    // the diagnostics blob (distinguishes a clean OTA from a brownout/watchdog).
+    resetReasonStr = resetReasonName(esp_reset_reason());
+
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.print("WiFi connecting");
@@ -1287,4 +1580,13 @@ void loop() {
     // Steady-state bridge: relay each bound zone's ambient + setpoint to the
     // Watts receiver on the 154 s heartbeat, or immediately on a state change.
     serviceScheduler();
+
+    // Bridge health heartbeat: republish the retained diagnostics blob so HA's
+    // RSSI / uptime / last-tx-age sensors stay fresh. Connect seeds the first one.
+    if (mqtt.connected() &&
+        (int32_t)(millis() - lastDiagAt) >= (int32_t)DIAG_PERIOD_MS) {
+        lastDiagAt = millis();
+        publishDiag();
+        publishAllZoneStates();   // keep each zone's last_tx_age fresh
+    }
 }
