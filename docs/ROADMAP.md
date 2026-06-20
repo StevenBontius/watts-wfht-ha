@@ -158,10 +158,20 @@ regressions and the failure modes that hardware testing doesn't exercise.
 **Per-milestone validation to add:**
 - [x] **M1** — field test one zone against the real receiver: confirmed
       end-to-end on hardware (HA → MQTT → ESP32 → CC1101 → receiver actuates)
-- [ ] **M1** — failsafe test: stall MQTT updates, confirm the stale-data timeout
-      forces idle (0x00) — a path hardware "happy path" testing never hits
-- [ ] **M1** — MQTT resilience: kill/restart the broker and WiFi, confirm reconnect
-      and that the loop keeps running on last-known values
+- [x] **M1** — failsafe test: stall a bound zone's source, confirm the stale-data
+      timeout stops transmitting it (receiver flags a lost thermostat) — a path
+      hardware "happy path" testing never hits. Confirmed on hardware via a
+      temporarily lowered `ZONE_STALE_MS` (30 s): the zone logged the stale drop,
+      TX ceased, HA reflected it, and it auto-recovered when the source returned.
+      Note: boot-with-MQTT-down reaches the same safe end-state by a different path
+      (no source data → never transmits → zone reports `pending`), so the
+      stale-drop loop intentionally isn't exercised there
+- [x] **M1** — MQTT resilience: kill/restart the broker and WiFi, confirm reconnect
+      and that the loop keeps running on last-known values — confirmed on hardware:
+      broker bounce triggered the non-blocking 5 s reconnect loop, then re-subscribed
+      and re-ran Z2M discovery on reconnect; both zones kept transmitting from cache
+      mid-outage (heartbeat is decoupled from MQTT, and a broker bounce is far short
+      of the 60 min `ZONE_STALE_MS` drop threshold)
 - [ ] **M1** — LWT/availability: pull power (not a clean disconnect), confirm the
       broker publishes `offline` on `watts-bridge/status` and HA marks the device
       unavailable; on reboot confirm `online` + a fresh `diag` blob + `reset_reason`
