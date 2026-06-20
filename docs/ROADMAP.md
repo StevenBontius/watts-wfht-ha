@@ -21,7 +21,7 @@ Status legend: `[x]` done · `[ ]` open · `[~]` partial.
 - [x] HTTP control surface: `/status`, `/tx-test`, `/tx-watts`, `/tx-pair`
 - [x] Non-blocking pairing stream in `loop()` (2 Hz, watchdog-safe)
 
-## M1 — Single-zone live bridge (in progress)
+## M1 — Single-zone live bridge ✅ (done)
 
 Goal: spoof one captured device ID, driven by HA over MQTT, transmitting accurate
 ambient + setpoint on the heartbeat, with failsafes — no HTTP, no RX, no
@@ -127,7 +127,7 @@ thermostat off.
       prints every CRC-valid frame (id, mode, amb, sp, cfh); `RX_DEBUG` flag dumps
       rejected bursts for protocol work
 
-## M3 — Multi-zone + device registry
+## M3 — Multi-zone + device registry (code complete — five-zone hardware test pending)
 
 Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 
@@ -138,15 +138,17 @@ Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
 - [~] **Per-zone transmit instances** (5 zones: 4 up + 1 down) — multi-zone
       scheduler (M1) + persisted bindings done; each zone relays its bound
       thermostat's ambient + setpoint on the heartbeat (no per-zone P-loop).
-      Remaining: validate all five zones together on real hardware
+      Should work; remaining: validate all five zones together on real hardware
 - [x] **Z2M discovery** (pulled forward, used to satisfy M1's subscribe step) —
       subscribes to retained `zigbee2mqtt/bridge/devices`, reassembles the fragmented
       payload, filters for `climate`-type devices, and reads `exposes` for the state
       topic + field names (temp / setpoint / mode). Zero-config for arbitrary
       (non-W100) thermostats. Re-runs on every inventory republish. Discovered
       thermostats held in a fixed registry (`MAX_THERMOSTATS`).
-- [ ] **Binding workflow** — associate a captured Watts channel with a discovered Z2M thermostat
-- [ ] **Pair a new virtual device ID** to replace the broken thermostat
+- [x] **Binding workflow** — associate a captured Watts channel with a discovered
+      Z2M thermostat, done via the binding web UI (`/bind` + the Capture-ID flow)
+- [x] **Pair a new virtual device ID** to replace the broken thermostat —
+      `/tx-pair` learns a bound zone's spoofed ID into the receiver (web UI button)
 
 ## M4 — Home Assistant UX (headless)
 
@@ -200,9 +202,11 @@ regressions and the failure modes that hardware testing doesn't exercise.
       `online` with a fresh diag blob.
 - [ ] **M2** — RX loopback: encode → decode roundtrip in firmware; assert recovered
       bytes + CRCs match the source frame
-- [ ] **M3** — registry persistence: write channels to NVS, reboot, confirm they reload
+- [x] **M3** — registry persistence: write channels to NVS, reboot, confirm they
+      reload — confirmed on hardware (bindings restored from NVS at boot each field test)
 - [ ] **M3** — multi-zone isolation: confirm a per-channel device ID change doesn't
       corrupt other zones' frames (the refactor most likely to silently break CRCs)
+      — part of the pending five-zone hardware test
 
 **Optional (deferred — manual hardware loop deemed sufficient for now):**
 - [ ] Host-side unit tests (`pio test -e native`) for the pure functions

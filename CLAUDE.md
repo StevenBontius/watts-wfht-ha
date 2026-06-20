@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-This is a reverse-engineering and firmware project to replace Watts WFHT-RF legacy underfloor heating thermostats with a headless Home Assistant bridge (ESP32 + CC1101). Phase 1 (RF protocol characterization) is complete. The firmware is a **standalone Arduino / PlatformIO app** (`firmware/`) — not ESPHome; the ESP owns WiFi, MQTT, the control loop, the NVS device registry and HA discovery itself. The single-zone live bridge is confirmed on real hardware — the full HA → MQTT → ESP32 → CC1101 → receiver path actuates the real Watts receiver end-to-end. RX/pairing-capture and persisted multi-zone bindings are implemented; remaining work (simultaneous five-zone validation, failsafe/resilience tests, headless HA UX) is tracked in `docs/ROADMAP.md`.
+This is a reverse-engineering and firmware project to replace Watts WFHT-RF legacy underfloor heating thermostats with a headless Home Assistant bridge (ESP32 + CC1101). Phase 1 (RF protocol characterization) is complete. The firmware is a **standalone Arduino / PlatformIO app** (`firmware/`) — not ESPHome; the ESP owns WiFi, MQTT, the control loop, the NVS device registry and HA discovery itself. The single-zone live bridge is confirmed on real hardware — the full HA → MQTT → ESP32 → CC1101 → receiver path actuates the real Watts receiver end-to-end. M1 (single-zone live bridge) and M2 (RX + pairing capture) are done; M3 (multi-zone + persisted device registry) is code-complete and expected to work, but the simultaneous five-zone hardware validation is still pending. Remaining work (five-zone validation, headless HA UX — M4) is tracked in `docs/ROADMAP.md`.
 
 ## Running the emulator
 
