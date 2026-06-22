@@ -32,8 +32,9 @@ temperature regulation and **ignores the call-for-heat flag** — it actuates on
 the transmitted ambient vs. setpoint alone. So the on-device P-loop is
 unnecessary for this stack; the bridge just transmits the real ambient + setpoint
 and runs the master in Comfort mode (HA is the sole scheduler). The P-loop /
-duty→cfh items below are **back-burnered** — kept only for a hypothetical dumb
-receiver that actuates on call-for-heat.
+duty→cfh items below are **now implemented and wired live** (byte 20 carries the
+computed flag) — but on the WFHC-MASTER they have **no actuation effect**; they
+exist only for a hypothetical dumb receiver that actuates on call-for-heat.
 
 - [x] **MQTT client** — `AsyncMqttClient` wired up: connect + non-blocking 5 s
       reconnect done (authenticates against HA users; broker settings in `config.h`).
@@ -63,13 +64,18 @@ receiver that actuates on call-for-heat.
       it leans on the hardware's own loss detection. Resumes automatically when
       the source returns. Threshold must exceed the source's longest quiet
       interval (raise if a healthy zone gets dropped). See [[receiver-beeps-on-lost-thermostat]].
-- [ ] _(back burner — nice-to-have)_ **Port the P-loop to firmware** —
-      `duty = clip((SP - T)/Bp, 0, 1)` plus the anti-short-cycle clamps and
-      demand-onset / SP-drop exceptions from the emulator. Unnecessary while the
-      receiver self-regulates (see note above)
-- [ ] _(back burner — nice-to-have)_ **Map duty → call-for-heat flag**
-      (0x00 / 0x64) on the cycle boundary — only meaningful if the P-loop runs;
-      cfh is otherwise transmitted as a constant benign 0x00
+- [x] **Port the P-loop to firmware** — `duty = clip((SP - T)/Bp, 0, 1)` plus the
+      anti-short-cycle clamps and demand-onset / SP-drop exceptions, ported from
+      the emulator into `cfhDuty` / `cfhOnDuration` / `cfhUpdate` (`Bp=2.1`,
+      `Cy=900s`, `On_min=Of_min=120s`). Runs per bound zone every `loop()` tick,
+      free-running its own `Cy` phase from first data (no captured anchor); paused
+      and re-anchored across a stale drop. Still unnecessary while the receiver
+      self-regulates (see note above) — kept for a dumb call-for-heat receiver.
+- [x] **Map duty → call-for-heat flag** (0x00 / 0x64) on the cycle boundary —
+      `cfhUpdate` returns the flag, transmitted live as byte 20 by the scheduler.
+      A flag flip marks the zone dirty so the burst fires promptly instead of
+      waiting for the 154 s heartbeat. Surfaced to HA as a per-zone `Call for heat`
+      sensor (`call_for_heat`: `calling`/`idle`) in the zone state blob.
 - [x] **Bridge observability** — retained `watts-bridge/diag` JSON blob
       republished every 30 s (`rssi`, `uptime`, `reset_reason`, `last_tx_age`,
       `ip`, `fw`), seeded on connect. Self-announcing HA MQTT-discovery configs

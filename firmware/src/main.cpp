@@ -42,13 +42,17 @@
 // ---------------------------------------------------------------------------
 // ARCHITECTURE
 // ---------------------------------------------------------------------------
-// The bridge is a transcoder, not a controller-of-record: it reads ambient +
-// setpoint from an HA/Z2M thermostat over MQTT and relays them to the Watts
-// receiver as spoofed frames. The receiver does its own temperature regulation
-// (confirmed on hardware -- it ignores the call-for-heat flag), so there is no
-// on-device control loop; the scheduler just retransmits each bound zone on the
-// 154 s heartbeat, or immediately when its source state changes. HA needs zero
-// configuration; the ESP owns the bindings (NVS, planned) and all coupling.
+// The bridge is mostly a transcoder, not a controller-of-record: it reads
+// ambient + setpoint from an HA/Z2M thermostat over MQTT and relays them to the
+// Watts receiver as spoofed frames. The scheduler retransmits each bound zone on
+// the 154 s heartbeat, or immediately when its source state changes. HA needs
+// zero configuration; the ESP owns the bindings (NVS) and all coupling.
+//
+// It also runs a per-zone call-for-heat P-loop (cfhUpdate, ported from the Python
+// emulator) that computes byte 20 live. The WFHC-MASTER does its own temperature
+// regulation and IGNORES this flag (confirmed on hardware -- it actuates on the
+// transmitted ambient vs. setpoint alone), so the loop has no actuation effect on
+// that receiver; it is wired live only for a dumb receiver that acts on byte 20.
 //
 // Pairing has two independent halves, joined on the ESP:
 //
@@ -276,6 +280,13 @@ struct ZoneBinding {
     uint32_t lastTxAt;        // millis() of last burst (0 = never sent)  [runtime]
     bool     dirty;           // source state changed -> transmit asap    [runtime]
     bool     stale;           // source went quiet -> TX dropped          [runtime]
+    // Call-for-heat P-loop state (see CFH_* constants). All runtime, reset on
+    // boot; the loop free-runs its own Cy phase per zone from first data.
+    bool     ctrlInit;        // cycle phase established                  [runtime]
+    uint32_t cycleStartMs;    // start of the current Cy window           [runtime]
+    uint32_t onPulseEndMs;    // absolute millis the ON pulse ends        [runtime]
+    float    prevDuty;        // previous-sample duty (demand-onset edge) [runtime]
+    uint8_t  cfh;             // current byte-20 flag (CFH_IDLE/CFH_CALL) [runtime]
 };
 static ZoneBinding bindings[MAX_THERMOSTATS];
 
@@ -286,11 +297,33 @@ static ZoneBinding *findBinding(const char *name) {
     return nullptr;
 }
 
+// Call-for-heat P-loop (frame byte 20), ported from tools/wfht_emulator.py.
+//   duty = clip((SP - T) / Bp, 0, 1)                     # P-only, no integral
+//   ON per Cy = clip(duty * Cy, On_min, Cy - Of_min)     # anti-short-cycle
+// Duty is sampled once per Cy boundary and held; a demand onset (0 -> positive)
+// fires an out-of-cycle ON pulse of >= On_min, and a setpoint drop that makes
+// the error negative cuts the active pulse immediately (user input bypasses
+// On_min). The flag is computed live per zone (cfhUpdate) and sent as byte 20.
+//
+// NOTE: the WFHC-MASTER receiver self-regulates on temperature and IGNORES this
+// flag (confirmed on hardware), so for that receiver the loop has no actuation
+// effect -- it is wired live only for a dumb receiver that acts on call-for-heat.
+static const float    CFH_BP_C      = 2.1f;            // proportional band, deg C (effective firmware value)
+static const uint32_t CFH_CY_MS     = 900UL * 1000;   // cycle time
+static const uint32_t CFH_ON_MIN_MS = 120UL * 1000;   // min ON  (anti-short-cycle floor)
+static const uint32_t CFH_OF_MIN_MS = 120UL * 1000;   // min OFF (ceiling on ON within a cycle)
+static const uint8_t  CFH_CALL = 0x64;                // byte-20 value when calling for heat
+static const uint8_t  CFH_IDLE = 0x00;                // byte-20 value when idle
+
 // Per-zone HA state publishing lives with the MQTT layer further down, but the
 // scheduler and the Z2M message handler (both above it) trigger it on every TX
 // and on a source change/recovery -- so it's forward-declared here. Returns the
 // publish packet-id (0 = the send buffer was full and nothing was queued).
 static uint16_t publishZoneState(const ZoneBinding *b);
+
+// The discovered thermostat backing a binding (defined with the MQTT layer);
+// the control loop above the MQTT layer reads its cached state, so forward it.
+static Thermostat *zoneThermostat(const ZoneBinding *b);
 
 // Request a paced (re)advertise of every retained config (see the sequencer near
 // the MQTT layer). Triggered on connect and on /bind; loop() drains it.
@@ -302,7 +335,7 @@ static void startAdvertise();
 static Preferences   prefs;
 static const char   *NVS_NS  = "watts";
 static const char   *NVS_KEY = "bindings";
-static const uint32_t NVS_VER = 1;
+static const uint32_t NVS_VER = 2;   // bumped: ZoneBinding gained P-loop runtime fields
 
 static void saveBindings() {
     prefs.begin(NVS_NS, false);
@@ -320,9 +353,12 @@ static void loadBindings() {
     prefs.end();
     int n = 0;
     for (int i = 0; i < MAX_THERMOSTATS; i++) {
-        bindings[i].lastTxAt = 0;       // runtime fields are meaningless after a
-        bindings[i].dirty    = false;   // reboot -- start each zone fresh
-        bindings[i].stale    = false;
+        bindings[i].lastTxAt  = 0;      // runtime fields are meaningless after a
+        bindings[i].dirty     = false;  // reboot -- start each zone fresh
+        bindings[i].stale     = false;
+        bindings[i].ctrlInit  = false;  // P-loop re-anchors on first data
+        bindings[i].prevDuty  = 0.0f;
+        bindings[i].cfh       = CFH_IDLE;
         if (bindings[i].used) {
             n++;
             Serial.printf("NVS binding: \"%s\" -> %02X%02X%02X\n", bindings[i].name,
@@ -737,6 +773,81 @@ static void zoneTxValues(const Thermostat *t, float *outSp, uint8_t *outMode) {
     *outSp   = (strcmp(t->lastMode, "off") == 0) ? 0.0f : t->lastSp;
 }
 
+// --- Call-for-heat P-loop (port of tools/wfht_emulator.py) -----------------
+
+// Target duty from error, P-only (emulator._duty with cp=a0=0, j1="Hot").
+static float cfhDuty(float sp, float tAmb) {
+    if (isnan(sp) || isnan(tAmb)) return 0.0f;
+    float duty = (sp - tAmb) / CFH_BP_C;
+    if (duty < 0.0f) return 0.0f;
+    if (duty > 1.0f) return 1.0f;
+    return duty;
+}
+
+// Raw duty -> ON duration (ms) with the anti-short-cycle clamps (emulator._on_duration).
+static uint32_t cfhOnDuration(float duty) {
+    if (duty <= 0.0f) return 0;
+    uint32_t raw = (uint32_t)(duty * (float)CFH_CY_MS);
+    if (raw < CFH_ON_MIN_MS)            return CFH_ON_MIN_MS;
+    if (raw > CFH_CY_MS - CFH_OF_MIN_MS) return CFH_CY_MS - CFH_OF_MIN_MS;
+    return raw;
+}
+
+// Advance one zone's call-for-heat state to `now` and return its byte-20 flag.
+// Mirrors emulator.Emulator.update: sample duty at each Cy boundary and hold it,
+// fire an out-of-cycle ON pulse on a demand onset, and cut the active pulse the
+// moment a setpoint drop makes the error negative. `sp` is the on-wire setpoint,
+// so an "off" zone (sp 0) collapses to no demand without a special case. Signed
+// millis() deltas tolerate the 49-day wrap (same idiom as the stale failsafe).
+static uint8_t cfhUpdate(ZoneBinding *b, float sp, float tAmb, uint32_t now) {
+    if (!b->ctrlInit) {                       // first data: free-run a fresh cycle
+        b->ctrlInit     = true;
+        b->cycleStartMs = now;
+        b->prevDuty     = 0.0f;
+        b->onPulseEndMs = now + cfhOnDuration(cfhDuty(sp, tAmb));
+    }
+    // Roll forward through any Cy boundaries crossed, resampling duty at each.
+    while ((int32_t)(now - b->cycleStartMs) >= (int32_t)CFH_CY_MS) {
+        b->cycleStartMs += CFH_CY_MS;
+        b->onPulseEndMs  = b->cycleStartMs + cfhOnDuration(cfhDuty(sp, tAmb));
+    }
+    float duty = cfhDuty(sp, tAmb);
+    // Demand onset: duty 0 -> positive while no pulse is active -> fire >= On_min.
+    if (duty > 0.0f && b->prevDuty <= 0.0f &&
+        (int32_t)(now - b->onPulseEndMs) >= 0) {
+        b->onPulseEndMs = now + CFH_ON_MIN_MS;
+    }
+    b->prevDuty = duty;
+    // Flag for `now`: calling while inside the ON pulse, unless the error just
+    // went non-positive (user dropped SP) -- then cut the pulse immediately.
+    if ((int32_t)(now - b->onPulseEndMs) < 0) {
+        if (duty <= 0.0f) { b->onPulseEndMs = now; b->cfh = CFH_IDLE; }
+        else                b->cfh = CFH_CALL;
+    } else {
+        b->cfh = CFH_IDLE;
+    }
+    return b->cfh;
+}
+
+// Advance every bound zone's call-for-heat loop once per loop() tick. A flag flip
+// marks the zone dirty so the scheduler transmits the new state promptly rather
+// than waiting for the 154 s heartbeat. Stale zones aren't transmitted, so their
+// loop is paused and re-anchored on recovery (handled in serviceScheduler).
+static void serviceControlLoops() {
+    uint32_t now = millis();
+    for (int i = 0; i < MAX_THERMOSTATS; i++) {
+        ZoneBinding &b = bindings[i];
+        if (!b.used || b.stale) continue;
+        Thermostat *t = zoneThermostat(&b);
+        if (!t || isnan(t->lastTemp) || isnan(t->lastSp)) continue;
+        float sp; uint8_t mode;
+        zoneTxValues(t, &sp, &mode);   // P-loop uses the on-wire setpoint
+        (void)mode;
+        uint8_t prev = b.cfh;
+        if (cfhUpdate(&b, sp, t->lastTemp, now) != prev) b.dirty = true;
+    }
+}
+
 // Transmit at most one A-B-A burst per call, >= MIN_BURST_GAP apart so no zone
 // hogs the shared radio. A zone whose source just changed (dirty) jumps ahead of
 // zones merely due for their 154 s heartbeat. Skipped while RX is active -- the
@@ -772,7 +883,9 @@ static void serviceScheduler() {
             int32_t  age = (int32_t)(now - lu);
             if (lu != 0 && age > (int32_t)ZONE_STALE_MS) {
                 if (!b->stale) {
-                    b->stale = true;
+                    b->stale    = true;
+                    b->ctrlInit = false;   // re-anchor the P-loop on recovery
+                    b->cfh      = CFH_IDLE;
                     Serial.printf("zone \"%s\": source stale (%lus) -- dropping TX; "
                                   "receiver will flag lost thermostat\n",
                                   t.name, (unsigned long)(age / 1000));
@@ -791,13 +904,13 @@ static void serviceScheduler() {
 
     float sp; uint8_t mode;
     zoneTxValues(zt, &sp, &mode);
-    sendBurst(zb->devId, zt->lastTemp, sp, 0x00, mode, 3, 400);   // A-B-A, cfh=0
+    sendBurst(zb->devId, zt->lastTemp, sp, zb->cfh, mode, 3, 400);   // A-B-A
     zb->lastTxAt = millis();
     zb->dirty    = false;
     lastBurstAt  = millis();
-    Serial.printf("TX zone \"%s\": id=%02X%02X%02X amb=%.1f sp=%.1f mode=0x%02X\n",
+    Serial.printf("TX zone \"%s\": id=%02X%02X%02X amb=%.1f sp=%.1f mode=0x%02X cfh=0x%02X\n",
                   zt->name, zb->devId[0], zb->devId[1], zb->devId[2],
-                  zt->lastTemp, sp, mode);
+                  zt->lastTemp, sp, mode, zb->cfh);
     publishZoneState(zb);   // reflect the just-sent values in HA
 }
 
@@ -1206,10 +1319,11 @@ static uint16_t publishZoneState(const ZoneBinding *b) {
     } else {
         float sp; uint8_t mode;
         zoneTxValues(t, &sp, &mode);
-        doc["status"]      = b->stale ? "stale" : "active";
-        doc["tx_ambient"]  = t->lastTemp;
-        doc["tx_setpoint"] = sp;
-        doc["mode"]        = t->lastMode[0] ? t->lastMode : "heat";
+        doc["status"]        = b->stale ? "stale" : "active";
+        doc["tx_ambient"]    = t->lastTemp;
+        doc["tx_setpoint"]   = sp;
+        doc["mode"]          = t->lastMode[0] ? t->lastMode : "heat";
+        doc["call_for_heat"] = (!b->stale && b->cfh == CFH_CALL) ? "calling" : "idle";
     }
     String body;
     serializeJson(doc, body);
@@ -1265,8 +1379,9 @@ static const ZoneSensor ZONE_SENSORS[] = {
     {"status",   "Status",            "status",      nullptr,       nullptr, false},
     {"setpoint", "Setpoint",          "tx_setpoint", "temperature", "°C",    false},
     {"ambient",  "Ambient",           "tx_ambient",  "temperature", "°C",    false},
-    {"mode",     "Mode",              "mode",        nullptr,       nullptr, false},
-    {"tx_age",   "Last transmit age", "last_tx_age", "duration",    "s",     true},
+    {"mode",     "Mode",              "mode",          nullptr,     nullptr, false},
+    {"cfh",      "Call for heat",     "call_for_heat", nullptr,     nullptr, false},
+    {"tx_age",   "Last transmit age", "last_tx_age",   "duration",  "s",     true},
     {"watts_id", "Watts ID",          "watts_id",    nullptr,       nullptr, true},
 };
 static const int ZONE_SENSOR_COUNT = sizeof(ZONE_SENSORS) / sizeof(ZONE_SENSORS[0]);
@@ -2151,8 +2266,10 @@ void loop() {
         }
     }
 
-    // Steady-state bridge: relay each bound zone's ambient + setpoint to the
-    // Watts receiver on the 154 s heartbeat, or immediately on a state change.
+    // Advance each zone's call-for-heat P-loop, then relay each bound zone's
+    // ambient + setpoint (+ the computed cfh flag) to the Watts receiver on the
+    // 154 s heartbeat, or immediately on a state change (incl. a cfh flip).
+    serviceControlLoops();
     serviceScheduler();
 
     // Bridge health heartbeat: republish the retained diagnostics blob so HA's
