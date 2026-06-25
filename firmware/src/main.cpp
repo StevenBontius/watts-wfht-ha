@@ -263,10 +263,57 @@ struct Thermostat {
     float    lastSp;
     char     lastMode[32];
     uint32_t lastUpdateMs;   // millis() of last state message (0 = never), liveness
+    bool     manual;         // true: temp from an explicit topic, setpoint/mode from
+                             // bridge-owned HA command topics; survives the rebuild below.
 };
 static const int MAX_THERMOSTATS = 8;
 static Thermostat thermostats[MAX_THERMOSTATS];
 static int        thermostatCount = 0;
+
+static Thermostat *findThermostat(const char *name) {
+    for (int i = 0; i < thermostatCount; i++)
+        if (strcmp(thermostats[i].name, name) == 0) return &thermostats[i];
+    return nullptr;
+}
+
+// Manual thermostats: for a zone that has only a temperature sensor and no Z2M
+// thermostat. The user gives a name and the topic of an ambient-temperature source
+// (e.g. a Z2M temp/humidity sensor; tempKey extracts the field from its JSON, "" =
+// the payload is already a bare scalar). The SETPOINT and MODE come from Home
+// Assistant: the bridge auto-publishes an HA climate discovery (so HA shows a
+// thermostat card) whose command topics are derived from the zone slug
+// (watts-bridge/zone/<slug>/set_setpoint and /set_mode), subscribes to them itself,
+// and persists the last HA-commanded values here so a reboot restores the target.
+// These defs are the persisted source of truth (NVS); they're materialized into
+// thermostats[] at boot and re-materialized after every Z2M inventory rebuild, so a
+// manual thermostat then flows through the same binding/scheduler/HA pipeline as a
+// discovered one.
+struct ManualThermostat {
+    bool  used;
+    char  name[40];
+    char  tempTopic[64];   // external ambient-temperature source topic
+    char  tempKey[24];     // JSON key to extract from tempTopic ("" = bare scalar)
+    float setpoint;        // HA-set target, persisted (seeded to MANUAL_DEFAULT_SP)
+    char  mode[8];         // HA-set mode, persisted ("heat"/"off"/"cool")
+};
+static const int MAX_MANUAL = MAX_THERMOSTATS;
+static ManualThermostat manualDefs[MAX_MANUAL];
+// A manual zone seeds a real target so HA's thermostat dial is live immediately --
+// a NaN target reads back as "unknown" and HA greys the dial you'd use to set it.
+static const float MANUAL_DEFAULT_SP = 20.0f;
+
+// zoneSlug (defined with the HA layer below) is needed up here to derive a manual
+// zone's bridge-owned command topics; forward-declare it.
+static void zoneSlug(const char *name, char *out, size_t n);
+// Bridge-owned MQTT command topics for a manual zone, derived from its slug.
+static void manualSetpointTopic(const char *name, char *out, size_t n) {
+    char slug[40]; zoneSlug(name, slug, sizeof(slug));
+    snprintf(out, n, "watts-bridge/zone/%s/set_setpoint", slug);
+}
+static void manualModeTopic(const char *name, char *out, size_t n) {
+    char slug[40]; zoneSlug(name, slug, sizeof(slug));
+    snprintf(out, n, "watts-bridge/zone/%s/set_mode", slug);
+}
 
 // Zone bindings: a discovered Z2M thermostat (by friendly_name) paired with the
 // Watts device ID the bridge spoofs for it. Kept separate from thermostats[] on
@@ -345,6 +392,38 @@ static void loadBindings() {
         }
     }
     Serial.printf("NVS: loaded %d binding(s)\n", n);
+}
+
+// Manual-thermostat defs persist as their own versioned blob, written only on
+// /add-manual and /del-manual. Kept separate from bindings so either can change
+// layout independently.
+static const char   *MAN_KEY = "manual";
+static const uint32_t MAN_VER = 2;   // bumped: temp source + key, HA-set setpoint/mode persisted
+
+static void saveManual() {
+    prefs.begin(NVS_NS, false);
+    prefs.putUInt("manver", MAN_VER);
+    prefs.putBytes(MAN_KEY, manualDefs, sizeof(manualDefs));
+    prefs.end();
+}
+
+static void loadManual() {
+    prefs.begin(NVS_NS, true);   // read-only
+    if (prefs.getUInt("manver", 0) == MAN_VER &&
+        prefs.getBytesLength(MAN_KEY) == sizeof(manualDefs)) {
+        prefs.getBytes(MAN_KEY, manualDefs, sizeof(manualDefs));
+    }
+    prefs.end();
+    int n = 0;
+    for (int i = 0; i < MAX_MANUAL; i++)
+        if (manualDefs[i].used) {
+            n++;
+            Serial.printf("NVS manual: \"%s\" temp=%s key=%s sp=%.1f mode=%s\n",
+                          manualDefs[i].name, manualDefs[i].tempTopic,
+                          manualDefs[i].tempKey[0] ? manualDefs[i].tempKey : "(scalar)",
+                          manualDefs[i].setpoint, manualDefs[i].mode);
+        }
+    Serial.printf("NVS: loaded %d manual thermostat(s)\n", n);
 }
 
 // ---------------------------------------------------------------------------
@@ -912,6 +991,57 @@ static void rxDisable() {
 }
 
 // ---------------------------------------------------------------------------
+// Manual thermostats: materialize persisted defs into thermostats[] and keep the
+// broker subscriptions live.
+// ---------------------------------------------------------------------------
+// Ensure every used manualDef has a thermostats[] entry, marked manual so the Z2M
+// inventory rebuild won't drop it. Idempotent: an existing entry keeps its cached
+// values (re-running this on a Z2M republish must not blank live readings); a
+// missing one is appended with an empty cache. Call at boot and after each rebuild.
+static void syncManualThermostats() {
+    for (int i = 0; i < MAX_MANUAL; i++) {
+        if (!manualDefs[i].used) continue;
+        Thermostat *t = findThermostat(manualDefs[i].name);
+        if (!t) {
+            if (thermostatCount >= MAX_THERMOSTATS) {
+                Serial.printf("manual: registry full -- \"%s\" not materialized\n",
+                              manualDefs[i].name);
+                continue;
+            }
+            t = &thermostats[thermostatCount++];
+            strlcpy(t->name, manualDefs[i].name, sizeof(t->name));
+            t->tempField[0] = t->spField[0] = t->modeField[0] = '\0';
+            t->lastTemp = NAN;
+            // Restore the persisted HA target so a reboot resumes it; ambient stays
+            // NAN until the sensor reports (zone holds "pending" until then). A def
+            // saved before seeding (NaN) is migrated to the default so the dial works.
+            t->lastSp   = isnan(manualDefs[i].setpoint) ? MANUAL_DEFAULT_SP
+                                                        : manualDefs[i].setpoint;
+            strlcpy(t->lastMode, manualDefs[i].mode[0] ? manualDefs[i].mode : "heat",
+                    sizeof(t->lastMode));
+            t->lastUpdateMs = 0;
+        }
+        t->manual = true;   // claim the entry against the Z2M rebuild's compaction
+    }
+}
+
+// (Re)subscribe each manual thermostat's external temp source plus its two
+// bridge-owned command topics. Called from onConnect (manual topics have no
+// inventory push to trigger a subscribe like Z2M state topics do) and after add.
+static void subscribeManualTopics() {
+    for (int i = 0; i < MAX_MANUAL; i++) {
+        if (!manualDefs[i].used) continue;
+        char spCmd[80], modeCmd[80];
+        manualSetpointTopic(manualDefs[i].name, spCmd, sizeof(spCmd));
+        manualModeTopic(manualDefs[i].name, modeCmd, sizeof(modeCmd));
+        mqtt.subscribe(manualDefs[i].tempTopic, 0);
+        mqtt.subscribe(spCmd, 0);
+        mqtt.subscribe(modeCmd, 0);
+        Serial.printf("manual: subscribed \"%s\" (temp=%s, %s, %s)\n",
+                      manualDefs[i].name, manualDefs[i].tempTopic, spCmd, modeCmd);
+    }
+}
+
 // Zigbee2MQTT inventory parsing -> thermostat discovery
 // ---------------------------------------------------------------------------
 // The inventory is a JSON array of device objects. A thermostat-capable device
@@ -936,7 +1066,12 @@ static void parseZ2MDevices(const char *json, size_t len) {
     JsonArray devices = doc.as<JsonArray>();
     Serial.printf("Z2M: inventory received (%u devices)\n", devices.size());
 
-    thermostatCount = 0;   // rebuilt from this inventory snapshot
+    // Rebuild only the Z2M-discovered entries from this snapshot; manual ones are
+    // persisted out-of-band, so compact them to the front and keep them.
+    int kept = 0;
+    for (int i = 0; i < thermostatCount; i++)
+        if (thermostats[i].manual) thermostats[kept++] = thermostats[i];
+    thermostatCount = kept;
     int found = 0;
     for (JsonObject dev : devices) {
         // definition is null for the coordinator; exposes iterates as empty then.
@@ -946,6 +1081,8 @@ static void parseZ2MDevices(const char *json, size_t len) {
 
             const char *name = dev["friendly_name"] | "?";
             const char *ieee = dev["ieee_address"]  | "?";
+            // A manual thermostat of the same name owns that name -- skip the Z2M one.
+            if (findThermostat(name)) { break; }
             const char *tempProp = nullptr, *spProp = nullptr, *modeProp = nullptr;
             for (JsonObject feat : ex["features"].as<JsonArray>()) {
                 const char *prop = feat["property"] | "";
@@ -974,6 +1111,7 @@ static void parseZ2MDevices(const char *json, size_t len) {
                 t.lastSp   = NAN;
                 t.lastMode[0] = '\0';
                 t.lastUpdateMs = 0;
+                t.manual = false;
                 char stateTopic[64];
                 snprintf(stateTopic, sizeof(stateTopic), "zigbee2mqtt/%s", name);
                 uint16_t pid = mqtt.subscribe(stateTopic, 0);
@@ -986,6 +1124,7 @@ static void parseZ2MDevices(const char *json, size_t len) {
     }
     if (found == 0)
         Serial.println("Z2M: no thermostat-capable devices in inventory");
+    syncManualThermostats();   // re-claim any manual slots freed by the rebuild
 }
 
 // Parse a thermostat state message (zigbee2mqtt/<name>) and log the current
@@ -1046,15 +1185,91 @@ static void handleStateMessage(const char *topic, const char *payload, size_t le
                   t->name, tbuf, sbuf, t->modeField[0] ? t->lastMode : "n/a");
 }
 
+// Manual-thermostat message. Three topic kinds per zone: the external ambient
+// source (tempTopic, parsed via tempKey if it's JSON), and the two bridge-owned
+// command topics fed by HA (set_setpoint / set_mode). Runs the same change-detect /
+// dirty+publish path as the Z2M handler, and persists HA-set targets. Returns true
+// if `topic` belonged to a manual zone (so the caller skips the Z2M handler).
+static bool handleManualMessage(const char *topic, const char *payload, size_t len) {
+    ManualThermostat *def = nullptr;
+    int field = -1;   // 0 = temp source, 1 = setpoint cmd, 2 = mode cmd
+    for (int i = 0; i < MAX_MANUAL && field < 0; i++) {
+        if (!manualDefs[i].used) continue;
+        char spCmd[80], modeCmd[80];
+        manualSetpointTopic(manualDefs[i].name, spCmd, sizeof(spCmd));
+        manualModeTopic(manualDefs[i].name, modeCmd, sizeof(modeCmd));
+        if      (strcmp(topic, manualDefs[i].tempTopic) == 0) field = 0;
+        else if (strcmp(topic, spCmd)   == 0)                 field = 1;
+        else if (strcmp(topic, modeCmd) == 0)                 field = 2;
+        if (field >= 0) def = &manualDefs[i];
+    }
+    if (!def)     return false;           // not a manual topic
+    if (len == 0) return true;            // empty payload (e.g. retained clear) -- ignore
+
+    Thermostat *t = findThermostat(def->name);
+    if (!t) return true;                  // def with no materialized entry (registry full)
+    ZoneBinding *b = findBinding(def->name);
+
+    char buf[40];                         // command/scalar payloads are short
+    size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+    memcpy(buf, payload, n);
+    buf[n] = '\0';
+
+    bool changed = false;
+    if (field == 0) {                     // ambient temperature source
+        float v;
+        if (def->tempKey[0]) {            // JSON source (e.g. Z2M sensor) -- parse raw
+            JsonDocument doc;
+            if (deserializeJson(doc, payload, len)) return true;   // bad JSON -- ignore
+            v = doc[def->tempKey] | NAN;
+            if (isnan(v)) return true;    // key absent from this report
+        } else {
+            v = atof(buf);                // payload is already a bare number
+        }
+        // Only the temp source is the liveness signal for the stale failsafe.
+        t->lastUpdateMs = millis();
+        if (b && b->stale) {
+            b->stale = false;
+            Serial.printf("zone \"%s\": source recovered -- resuming TX\n", def->name);
+            publishZoneState(b);
+        }
+        if (v != t->lastTemp) { t->lastTemp = v; changed = true; }
+    } else if (field == 1) {              // setpoint command from HA -- persist it
+        float v = atof(buf);
+        if (v != t->lastSp) {
+            t->lastSp = v; def->setpoint = v; saveManual(); changed = true;
+        }
+    } else {                             // mode command from HA -- persist it
+        if (strcmp(buf, t->lastMode) != 0) {
+            strlcpy(t->lastMode, buf, sizeof(t->lastMode));
+            strlcpy(def->mode,   buf, sizeof(def->mode));
+            saveManual(); changed = true;
+        }
+    }
+    if (!changed) return true;
+
+    if (b) { b->dirty = true; publishZoneState(b); }
+
+    char tbuf[8], sbuf[8];
+    if (isnan(t->lastTemp)) strcpy(tbuf, "--"); else snprintf(tbuf, sizeof(tbuf), "%.1f", t->lastTemp);
+    if (isnan(t->lastSp))   strcpy(sbuf, "--"); else snprintf(sbuf, sizeof(sbuf), "%.1f", t->lastSp);
+    Serial.printf("manual %s: temp=%s setpoint=%s mode=%s\n",
+                  def->name, tbuf, sbuf, t->lastMode[0] ? t->lastMode : "n/a");
+    return true;
+}
+
 // AsyncMqttClient message callback. Large retained payloads arrive in fragments
 // (index..index+len of total); reassemble before parsing.
 static void onMqttMessage(char *topic, char *payload,
                           AsyncMqttClientMessageProperties props,
                           size_t len, size_t index, size_t total) {
-    // Thermostat state topics are small single-fragment JSON payloads.
+    // Thermostat state topics are small single-fragment payloads (Z2M JSON blob or
+    // a manual scalar). Try the manual topics first, then fall through to Z2M.
     if (strcmp(topic, Z2M_DEVICES_TOPIC) != 0) {
-        if (index == 0 && len == total)
-            handleStateMessage(topic, payload, len);
+        if (index == 0 && len == total) {
+            if (!handleManualMessage(topic, payload, len))
+                handleStateMessage(topic, payload, len);
+        }
         return;
     }
 
@@ -1238,15 +1453,20 @@ static uint16_t publishZoneState(const ZoneBinding *b) {
     doc["last_tx_age"] = b->lastTxAt ? (int32_t)((millis() - b->lastTxAt) / 1000) : -1;
 
     Thermostat *t = zoneThermostat(b);
-    if (!t || isnan(t->lastTemp) || isnan(t->lastSp)) {
+    bool haveTemp = t && !isnan(t->lastTemp);
+    bool haveSp   = t && !isnan(t->lastSp);
+    if (!haveTemp && !haveSp) {
         doc["status"] = "pending";
         doc["mode"]   = "unknown";
     } else {
-        float sp; uint8_t mode;
-        zoneTxValues(t, &sp, &mode);
-        doc["status"]        = b->stale ? "stale" : "active";
-        doc["tx_ambient"]    = t->lastTemp;
-        doc["tx_setpoint"]   = sp;
+        // Publish each field as soon as it's known so the HA climate card populates
+        // immediately (target shows the moment it's set, before the sensor reports).
+        // tx_setpoint is the *configured* target for display -- the off->0 wire value
+        // is computed separately at transmit time (zoneTxValues), so a zone in "off"
+        // still shows its real target on the card, with "off" conveyed by mode.
+        doc["status"] = b->stale ? "stale" : ((haveTemp && haveSp) ? "active" : "pending");
+        if (haveTemp) doc["tx_ambient"]  = t->lastTemp;
+        if (haveSp)   doc["tx_setpoint"] = t->lastSp;
         doc["mode"]          = t->lastMode[0] ? t->lastMode : "heat";
         doc["call_for_heat"] = (!b->stale && b->ctrl.flag == CFH_CALL) ? "calling" : "idle";
     }
@@ -1293,6 +1513,70 @@ static uint16_t publishZoneSensor(const char *slug, const char *zoneName,
     return mqtt.publish(topic, 1, true, body.c_str());
 }
 
+// Is this zone backed by a manual thermostat (vs a Z2M-discovered one)?
+static bool isManualZone(const char *name) {
+    for (int i = 0; i < MAX_MANUAL; i++)
+        if (manualDefs[i].used && strcmp(manualDefs[i].name, name) == 0) return true;
+    return false;
+}
+
+// HA climate discovery for a MANUAL zone: a full thermostat card whose commands the
+// bridge owns. current temp + target + mode all read from the retained zone blob;
+// the command topics are the bridge-owned set_setpoint / set_mode the bridge itself
+// subscribes to. Not published for Z2M zones (those are driven by their own
+// thermostat). Returns the publish packet-id (0 = send buffer full).
+static uint16_t publishZoneClimate(const ZoneBinding *b) {
+    if (!mqtt.connected()) return 0;
+    char slug[40]; zoneSlug(b->name, slug, sizeof(slug));
+    char blob[64];  snprintf(blob, sizeof(blob), "watts-bridge/zone/%s", slug);
+
+    JsonDocument doc;
+    doc["name"] = b->name;
+    char uid[64]; snprintf(uid, sizeof(uid), "watts_zone_%s_climate", slug);
+    doc["unique_id"] = uid;
+
+    char spCmd[80], modeCmd[80];
+    manualSetpointTopic(b->name, spCmd, sizeof(spCmd));
+    manualModeTopic(b->name, modeCmd, sizeof(modeCmd));
+
+    doc["modes"][0] = "off";
+    doc["modes"][1] = "heat";
+    doc["modes"][2] = "cool";            // bridge maps cool -> byte-12 bit1 clear
+    doc["min_temp"]         = 5;
+    doc["max_temp"]         = 30;
+    doc["temp_step"]        = 0.5;
+    doc["temperature_unit"] = "C";
+    doc["retain"]           = false;     // command publishes must not be retained
+
+    doc["current_temperature_topic"]    = blob;
+    doc["current_temperature_template"] = "{{ value_json.tx_ambient }}";
+    doc["temperature_command_topic"]    = spCmd;
+    doc["temperature_state_topic"]      = blob;
+    doc["temperature_state_template"]   = "{{ value_json.tx_setpoint }}";
+    doc["mode_command_topic"]           = modeCmd;
+    doc["mode_state_topic"]             = blob;
+    // The blob carries mode "unknown" until the first temp arrives -- coerce any
+    // unrecognised value to a valid mode so HA doesn't reject the state.
+    doc["mode_state_template"] =
+        "{{ value_json.mode if value_json.mode in ['off','heat','cool'] else 'heat' }}";
+
+    doc["availability_topic"]    = AVAIL_TOPIC;
+    doc["payload_available"]     = "online";
+    doc["payload_not_available"] = "offline";
+    JsonObject dev = doc["device"].to<JsonObject>();
+    char devId[48]; snprintf(devId, sizeof(devId), "watts_zone_%s", slug);
+    dev["identifiers"][0] = devId;
+    char devName[80]; snprintf(devName, sizeof(devName), "Watts zone: %s", b->name);
+    dev["name"]       = devName;
+    dev["via_device"] = "watts_bridge";
+
+    char topic[96];
+    snprintf(topic, sizeof(topic), "homeassistant/climate/watts_zone_%s/config", slug);
+    String body;
+    serializeJson(doc, body);
+    return mqtt.publish(topic, 1, true, body.c_str());
+}
+
 // The set of sensors making up a zone's HA device, backed by the retained zone
 // state blob. The single source of truth for publish (the re-advertise
 // sequencer), clear (on unbind), and the object list -- so they can't drift apart.
@@ -1331,6 +1615,9 @@ static void clearZoneDiscovery(const ZoneBinding *b) {
                  "homeassistant/sensor/watts_zone_%s/%s/config", slug, s.object);
         mqtt.publish(topic, 1, true, "");
     }
+    snprintf(topic, sizeof(topic),
+             "homeassistant/climate/watts_zone_%s/config", slug);
+    mqtt.publish(topic, 1, true, "");        // the climate entity (manual zones)
     snprintf(topic, sizeof(topic), "watts-bridge/zone/%s", slug);
     mqtt.publish(topic, 1, true, "");
 }
@@ -1357,7 +1644,8 @@ enum AdvPhase : uint8_t { ADV_IDLE, ADV_BRIDGE, ADV_DIAG, ADV_ZONES, ADV_DONE };
 static AdvPhase advPhase     = ADV_IDLE;
 static int      advBridgeStep = 0;   // 0..BRIDGE_STEP_COUNT-1
 static int      advZoneIdx    = 0;   // index into bindings[]
-static int      advZoneStep   = 0;   // 0..ZONE_SENSOR_COUNT  (last = state blob)
+static int      advZoneStep   = 0;   // 0..ZONE_SENSOR_COUNT-1 sensors, then state blob,
+                                     // then (manual zones) the climate config
 
 // Request a full paced (re)advertise from the start. Cheap: just rewinds the
 // cursor; loop()'s serviceAdvertise() does the work. Safe to call mid-advertise.
@@ -1381,20 +1669,23 @@ static void serviceAdvertise() {
         case ADV_DIAG:
             if (publishDiag()) { lastDiagAt = millis(); advPhase = ADV_ZONES; }
             return;
-        case ADV_ZONES:
+        case ADV_ZONES: {
             while (advZoneIdx < MAX_THERMOSTATS && !bindings[advZoneIdx].used)
                 advZoneIdx++;
             if (advZoneIdx >= MAX_THERMOSTATS) { advPhase = ADV_DONE; return; }
-            if (advZoneStep < ZONE_SENSOR_COUNT) {
-                if (advertiseZoneSensorStep(&bindings[advZoneIdx], advZoneStep))
-                    advZoneStep++;
-            } else {                              // last step: seed the state blob
-                if (publishZoneState(&bindings[advZoneIdx])) {
+            ZoneBinding *b = &bindings[advZoneIdx];
+            if (advZoneStep < ZONE_SENSOR_COUNT) {            // per-zone sensors
+                if (advertiseZoneSensorStep(b, advZoneStep)) advZoneStep++;
+            } else if (advZoneStep == ZONE_SENSOR_COUNT) {    // seed the state blob
+                if (publishZoneState(b)) advZoneStep++;
+            } else {                                          // climate (manual only)
+                if (!isManualZone(b->name) || publishZoneClimate(b)) {
                     advZoneStep = 0;
                     advZoneIdx++;
                 }
             }
             return;
+        }
         default:
             return;
     }
@@ -1430,6 +1721,9 @@ static void initMqtt() {
         // Subscribe to the retained Z2M inventory; the broker delivers it at once.
         uint16_t pid = mqtt.subscribe(Z2M_DEVICES_TOPIC, 0);
         Serial.printf("MQTT: subscribed to %s (pid %u)\n", Z2M_DEVICES_TOPIC, pid);
+        // Manual thermostats have no inventory push to trigger a subscribe, so do it
+        // here on every (re)connect.
+        subscribeManualTopics();
     });
     mqtt.onDisconnect([](AsyncMqttClientDisconnectReason reason) {
         Serial.printf("MQTT: disconnected (reason %d), retry in 5s\n", (int)reason);
@@ -1642,6 +1936,26 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(<!doctype html>
 </section>
 
 <section>
+ <h2>Manual thermostats</h2>
+ <p class="muted" style="font-size:.8rem;margin:0 0 .8rem">Add a thermostat for a
+  zone that has only a temperature sensor (no Z2M thermostat). Give it a name and
+  the Zigbee2MQTT sensor's state topic, plus the JSON key for temperature (e.g.
+  <span class="id">temperature</span>) — or leave the key blank if the topic carries
+  a bare number. <b>Home Assistant then shows a thermostat card with setpoint and
+  mode controls</b> (no HA YAML needed). Then bind it to a Watts ID in the dropdown
+  above.</p>
+ <table><thead><tr><th>Name</th><th>Bound</th><th></th></tr></thead>
+ <tbody id="mrows"><tr><td colspan="3" class="muted">loading…</td></tr></tbody></table>
+ <div class="row">
+  <div><label>Name</label><input id="mname" placeholder="woonkamer"></div>
+  <div><label>Temp source topic</label><input id="mtemp" placeholder="zigbee2mqtt/temp_hum_living_room"></div>
+  <div><label>Temp JSON key (blank = bare number)</label><input id="mkey" placeholder="temperature"></div>
+ </div>
+ <button id="addm">Add manual thermostat</button>
+ <div id="mmsg"></div>
+</section>
+
+<section>
  <h2>Device</h2>
  <button class="danger" onclick="resetWifi()">Reset WiFi / MQTT setup</button>
  <p class="muted" style="font-size:.8rem;margin:.6rem 0 0">Clears stored network
@@ -1669,10 +1983,31 @@ async function loadBindings(){
 }
 async function loadThermostats(){
  try{const t=await jget("/thermostats");const sel=$("#name");const cur=sel.value;
-  sel.innerHTML=t.length?t.map(x=>`<option value="${x.name}">${x.name}${x.bound?" (bound)":""}</option>`).join("")
+  sel.innerHTML=t.length?t.map(x=>`<option value="${x.name}">${x.name}${x.manual?" [manual]":""}${x.bound?" (bound)":""}</option>`).join("")
     :'<option value="">none discovered yet</option>';
   if(cur)sel.value=cur;
+  const man=t.filter(x=>x.manual);
+  $("#mrows").innerHTML=man.length?man.map(x=>`<tr>
+   <td>${x.name}</td><td>${x.bound?"yes":"—"}</td>
+   <td style="white-space:nowrap"><button class="danger" onclick="delManual('${x.name}')">Delete</button></td>
+   </tr>`).join(""):'<tr><td colspan="3" class="muted">none yet</td></tr>';
  }catch(e){msg(e.message,"err");}
+}
+function mmsg(t,c){const m=$("#mmsg");m.textContent=t;m.className=c||"";}
+async function addManual(){
+ const name=$("#mname").value.trim(),temp=$("#mtemp").value.trim(),
+  key=$("#mkey").value.trim();
+ if(!name||!temp)return mmsg("name and temp source topic are required","err");
+ let q=`/add-manual?name=${encodeURIComponent(name)}&temp=${encodeURIComponent(temp)}`;
+ if(key)q+="&key="+encodeURIComponent(key);
+ try{const r=await jget(q);mmsg(r,"ok");
+  $("#mname").value=$("#mtemp").value=$("#mkey").value="";
+  refresh();}catch(e){mmsg(e.message,"err");}
+}
+async function delManual(name){
+ if(!confirm("Delete manual thermostat \""+name+"\"? Any binding on it stops transmitting."))return;
+ try{await jget("/del-manual?name="+encodeURIComponent(name));mmsg("deleted "+name,"ok");
+  refresh();}catch(e){mmsg(e.message,"err");}
 }
 async function unbind(name){
  try{await jget("/unbind?name="+encodeURIComponent(name));msg("Unbound "+name,"ok");
@@ -1706,6 +2041,7 @@ $("#bind").onclick=async()=>{
  try{const r=await jget(`/bind?name=${encodeURIComponent(name)}&id=${id}`);
   msg(r,"ok");$("#id").value="";refresh();}catch(e){msg(e.message,"err");}
 };
+$("#addm").onclick=addManual;
 let capTimer=null;
 $("#cap").onclick=async()=>{
  if(capTimer){clearInterval(capTimer);capTimer=null;await jget("/pair-cancel");
@@ -1877,6 +2213,94 @@ static void setupRoutes() {
         Serial.printf("unbound \"%s\"\n", b->name);
         req->send(200, "text/plain", "unbound");
     });
+
+    // Create/update a manual thermostat: a name + a temperature source topic (+ an
+    // optional JSON key to extract from it). Persists the def, materializes it into
+    // thermostats[], and (if connected) subscribes -- after which it appears in the
+    // bind dropdown like a discovered one. Setpoint/mode are bridge-owned, fed by
+    // the HA climate card that gets auto-published once the zone is bound (/bind).
+    server.on("/add-manual", HTTP_GET, [](AsyncWebServerRequest *req) {
+        auto p = [&](const char *k) -> String {
+            return req->hasParam(k) ? req->getParam(k)->value() : String();
+        };
+        String name = p("name"), temp = p("temp"), key = p("key");
+        if (name.isEmpty() || temp.isEmpty()) {
+            req->send(400, "text/plain",
+                      "usage: /add-manual?name=<n>&temp=<topic>[&key=<json-key>]");
+            return;
+        }
+        // Reuse an existing def of the same name, else take a free slot.
+        ManualThermostat *m = nullptr;
+        for (int i = 0; i < MAX_MANUAL; i++)
+            if (manualDefs[i].used && strcmp(manualDefs[i].name, name.c_str()) == 0) {
+                m = &manualDefs[i]; break;
+            }
+        bool updating = (m != nullptr);
+        if (!m)
+            for (int i = 0; i < MAX_MANUAL; i++)
+                if (!manualDefs[i].used) { m = &manualDefs[i]; break; }
+        if (!m) { req->send(507, "text/plain", "manual table full"); return; }
+
+        // Updating an existing def: drop its old temp subscription before overwriting
+        // (the command topics are slug-derived, so they're stable across edits).
+        if (updating && mqtt.connected()) mqtt.unsubscribe(m->tempTopic);
+
+        if (!updating) {              // new def: seed a live target + default mode
+            m->setpoint = MANUAL_DEFAULT_SP;
+            strlcpy(m->mode, "heat", sizeof(m->mode));
+        }
+        m->used = true;
+        strlcpy(m->name,      name.c_str(), sizeof(m->name));
+        strlcpy(m->tempTopic, temp.c_str(), sizeof(m->tempTopic));
+        strlcpy(m->tempKey,   key.c_str(),  sizeof(m->tempKey));
+        saveManual();
+        syncManualThermostats();
+        if (mqtt.connected()) { subscribeManualTopics(); startAdvertise(); }
+        Serial.printf("manual added: \"%s\" (temp=%s key=%s)\n",
+                      m->name, m->tempTopic, m->tempKey[0] ? m->tempKey : "(scalar)");
+        req->send(200, "text/plain", "added manual thermostat");
+    });
+
+    // Remove a manual thermostat: unsubscribe, drop its def + thermostats[] entry.
+    // Any binding on it is left intact (goes "pending"), mirroring how a vanished
+    // Z2M device leaves its binding; /unbind clears it separately.
+    server.on("/del-manual", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->hasParam("name")) {
+            req->send(400, "text/plain", "usage: /del-manual?name=<n>");
+            return;
+        }
+        const char *name = req->getParam("name")->value().c_str();
+        ManualThermostat *m = nullptr;
+        for (int i = 0; i < MAX_MANUAL; i++)
+            if (manualDefs[i].used && strcmp(manualDefs[i].name, name) == 0) {
+                m = &manualDefs[i]; break;
+            }
+        if (!m) { req->send(404, "text/plain", "no such manual thermostat"); return; }
+
+        if (mqtt.connected()) {
+            char spCmd[80], modeCmd[80], topic[96], slug[40];
+            manualSetpointTopic(m->name, spCmd, sizeof(spCmd));
+            manualModeTopic(m->name, modeCmd, sizeof(modeCmd));
+            mqtt.unsubscribe(m->tempTopic);
+            mqtt.unsubscribe(spCmd);
+            mqtt.unsubscribe(modeCmd);
+            // Remove the HA climate entity (the zone is no longer manual).
+            zoneSlug(m->name, slug, sizeof(slug));
+            snprintf(topic, sizeof(topic),
+                     "homeassistant/climate/watts_zone_%s/config", slug);
+            mqtt.publish(topic, 1, true, "");
+        }
+        m->used = false;
+        saveManual();
+        // Drop its materialized thermostats[] entry (compact the array).
+        int w = 0;
+        for (int r = 0; r < thermostatCount; r++)
+            if (strcmp(thermostats[r].name, name) != 0) thermostats[w++] = thermostats[r];
+        thermostatCount = w;
+        Serial.printf("manual removed: \"%s\"\n", name);
+        req->send(200, "text/plain", "removed manual thermostat");
+    });
+
     server.on("/bindings", HTTP_GET, [](AsyncWebServerRequest *req) {
         JsonDocument doc;
         JsonArray    arr = doc.to<JsonArray>();
@@ -1913,8 +2337,9 @@ static void setupRoutes() {
         JsonArray    arr = doc.to<JsonArray>();
         for (int i = 0; i < thermostatCount; i++) {
             JsonObject o = arr.add<JsonObject>();
-            o["name"]  = thermostats[i].name;
-            o["bound"] = findBinding(thermostats[i].name) != nullptr;
+            o["name"]   = thermostats[i].name;
+            o["bound"]  = findBinding(thermostats[i].name) != nullptr;
+            o["manual"] = thermostats[i].manual;
         }
         String body;
         serializeJson(doc, body);
@@ -2068,6 +2493,8 @@ void setup() {
     Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
 
     loadBindings();   // restore zone bindings from NVS before MQTT/discovery
+    loadManual();             // restore manual thermostat defs ...
+    syncManualThermostats();  // ... and materialize them into thermostats[]
     initCC1101();
     initMqtt();
     setupRoutes();

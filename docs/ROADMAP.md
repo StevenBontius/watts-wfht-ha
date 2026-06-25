@@ -167,6 +167,13 @@ Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
       reflash only while NVS is empty; once the portal saves, NVS is authoritative.
       `GET /reset-wifi` (and a button on the binding UI) clears creds and reboots
       into the portal. Password fields have a show/hide toggle.
+- [x] **Manual thermostats (sensor-only zones)** — for a zone with a temperature
+      sensor but no Z2M thermostat. `GET /add-manual` (web UI) takes a name + the
+      sensor's MQTT topic (+ optional JSON key); the bridge owns the zone's
+      setpoint/mode command topics (`watts-bridge/zone/<slug>/set_setpoint` and
+      `/set_mode`), persists the HA-set target across reboots, and auto-publishes a
+      `homeassistant/climate/...` discovery so HA shows a full thermostat card with
+      no hand-written YAML. Then bind to a Watts ID like any other zone.
 - [ ] **Per-zone parental lock** toggle — gate W100 local button input on/off
 - [ ] **MQTT discovery entities** — expose status + lock per zone without cluttering
       the climate dashboard

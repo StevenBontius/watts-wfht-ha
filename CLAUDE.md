@@ -36,7 +36,12 @@ per bound zone on the 154 s heartbeat (or on change), with RX, pairing capture,
 and NVS-persisted bindings. The HTTP server is the operational config surface:
 `/tx-pair` (accepts `id=` to pair a bound zone's device ID into the receiver),
 `/tx-pair-status`, `/pair-listen`, `/pair-status`, `/pair-cancel`, `/bind`,
-`/unbind`, `/bindings`, `/thermostats`, plus the served binding/pairing web page
+`/unbind`, `/bindings`, `/thermostats`, `/add-manual` (add a manual thermostat for a
+zone that has only a temperature sensor, no Z2M thermostat: `name=` + a temperature
+source topic `temp=` + optional JSON key `key=` for a Z2M sensor payload. The bridge
+owns the setpoint/mode command topics and auto-publishes an HA `climate` discovery for
+the bound zone, so Home Assistant shows a thermostat card with setpoint/mode controls
+— no HA YAML needed), `/del-manual`, plus the served binding/pairing web page
 at `/` and `/reset-wifi`. The unauthenticated debug/test endpoints (`/status`,
 `/tx-test`, `/tx-watts`, `/rx-on`, `/rx-off`) are gated behind the `DEBUG_HTTP`
 build flag (default 0; set to 1 in `config.h` for radio bring-up). The on-device
