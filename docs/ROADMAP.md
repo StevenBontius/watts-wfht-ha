@@ -174,7 +174,14 @@ Goal: all five MVP zones, persisted, each bound to a Z2M thermostat.
       `/set_mode`), persists the HA-set target across reboots, and auto-publishes a
       `homeassistant/climate/...` discovery so HA shows a full thermostat card with
       no hand-written YAML. Then bind to a Watts ID like any other zone.
-- [ ] **Per-zone parental lock** toggle — gate W100 local button input on/off
+- [ ] _(nice-to-have, deferred)_ **Per-zone parental lock** toggle. The W100/TH-S04D
+      does **not** expose `child_lock` in Z2M, so the buttons can't be gated directly;
+      the only lever is an upstream override — lock snapshots the current setpoint,
+      transmits that held value to Watts (heating stays correct), and writes it back to
+      the W100 to revert button-originated changes (display snaps back after a brief
+      bounce). v1 semantics: lock = frozen setpoint (unlock in HA to adjust). Open
+      decision: freeze `system_mode` too (else a kid can still switch the zone off).
+      Pairs with the MQTT-discovery `switch` entity below. See [[web-ui-vs-ha-native-config]].
 - [ ] **MQTT discovery entities** — expose status + lock per zone without cluttering
       the climate dashboard
 - [ ] Document the HA/MQTT topic contract
