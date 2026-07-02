@@ -9,10 +9,12 @@ the full HA → MQTT → ESP32 → CC1101 → receiver path actuates a real Watt
 MQTT-resilience, LWT/availability and the stale-data failsafe are all validated on
 hardware. Also shipped: the RX path with off-frame pairing capture, NVS-persisted
 multi-zone bindings, captive-portal WiFi/MQTT provisioning, a self-contained web UI
-(binding **and** receiver pairing), and self-announcing per-zone Home Assistant
-discovery entities. Remaining: simultaneous five-zone validation on hardware,
-per-zone parental lock, and gating the HTTP debug endpoints behind a build flag —
-see [`docs/ROADMAP.md`](/docs/ROADMAP.md).
+(binding **and** receiver pairing) behind optional HTTP digest auth, HA-driven
+manual thermostats for sensor-only zones, and self-announcing per-zone Home
+Assistant discovery entities. The debug/test HTTP endpoints are gated behind a
+`DEBUG_HTTP` build flag (default off). Remaining: simultaneous five-zone
+validation on hardware, plus deferred nice-to-haves (per-zone parental lock, OTA
+firmware update) — see [`docs/ROADMAP.md`](/docs/ROADMAP.md).
 
 The reverse engineering process of the wireless communication can be found here: [Watts WFHT RF Protocol Reverse Engineering](/docs/WATTS_WFHT_RF_PROTOCOL.md)
 
@@ -48,8 +50,8 @@ Aqara W100 (temp + humidity + up/down/scene buttons)
         │     - caches each bound zone's ambient + setpoint + mode
         │     - builds the 192-bit fixed frame + custom application CRC-8
         │       + radio CRC-16
-        │     - call-for-heat byte sent as a constant benign 0x00
-        │       (the receiver ignores it — see below)
+        │     - call-for-heat byte (20) carries a live P-loop duty flag
+        │       (the WFHC-MASTER ignores it — see below)
         ▼
    CC1101 Radio Transceiver
         │     - 0xD391 sync word, A-B-A burst every 154 s (or instantly on change)
@@ -60,19 +62,21 @@ Aqara W100 (temp + humidity + up/down/scene buttons)
    Manifold servo for the zone opens/closes the water loop
 ```
 
-### Why there is no control loop on the ESP32
+### Why the ESP32's control loop doesn't drive the floor
 
 Confirmed on hardware: the **WFHC-MASTER receiver does its own temperature
-regulation and ignores the call-for-heat flag**  it actuates on the transmitted
-ambient vs. setpoint alone. So the bridge is a pure relay: it transmits the real
-ambient + setpoint, sends call-for-heat as a constant benign `0x00`, and the master
-runs in **Comfort mode** with Home Assistant as the sole scheduler.
+regulation and ignores the call-for-heat flag** — it actuates on the transmitted
+ambient vs. setpoint alone. So the bridge is effectively a pure relay: it transmits
+the real ambient + setpoint and the master runs in **Comfort mode** with Home
+Assistant as the sole scheduler.
 
 A chronoproportional P-controller (`duty = clip((SP − T)/Bp, 0, 1)`, with
-anti-short-cycle clamps) *is* implemented and validated in the Python emulator
-(`tools/wfht_emulator.py`), but it is **back-burnered** for this stack — kept only
-for a hypothetical dumb receiver that actuates on the call-for-heat flag instead of
-self-regulating.
+anti-short-cycle clamps) is validated in the Python emulator
+(`tools/wfht_emulator.py`) and **now ported to firmware** — it runs per bound zone
+and its computed duty is transmitted live as the call-for-heat flag on byte 20 (and
+surfaced to HA as a per-zone `Call for heat` sensor). But on the WFHC-MASTER that
+flag has **no actuation effect**; the loop is kept only for a hypothetical dumb
+receiver that actuates on call-for-heat instead of self-regulating.
 
 ### Edge Resiliency
 
@@ -102,7 +106,13 @@ assets) at `GET /` that makes both binding and pairing a no-typing browser task:
   is switched off, showing the captured ambient temperature so you can confirm it's
   the right room before binding;
 * a per-zone **Pair** button that initiates the receiver-pairing sequence (see below)
-  with a live countdown.
+  with a live countdown;
+* an **Add manual thermostat** form for zones that have only a temperature sensor
+  and no Z2M thermostat (see below).
+
+The config page and its endpoints can be put behind optional HTTP digest auth
+(set credentials in `config.h`); the debug/test endpoints (`/tx-test`, `/rx-on`,
+…) are separately gated behind the `DEBUG_HTTP` build flag and off by default.
 
 ### Headless Home Assistant Integration
 
@@ -111,11 +121,18 @@ duplicate *climate* dashboard entities, the UI stays focused on the Aqara W100s.
 It does self-announce lightweight MQTT-discovery entities: a bridge device
 (connectivity + diagnostics: RSSI, uptime, reset reason, last-TX age, IP, firmware)
 and one nested device per bound zone (status, transmitted setpoint/ambient, mode,
-last-TX age, spoofed Watts ID), all sharing the bridge's LWT so a dead bridge greys
-everything out together.
+call-for-heat, last-TX age, spoofed Watts ID), all sharing the bridge's LWT so a
+dead bridge greys everything out together.
 
-*Planned:* a per-zone parental lock toggle that gates the local W100 button input on
-or off, preventing accidental or unauthorized schedule overrides.
+For a zone that has only a temperature sensor and no Z2M thermostat, the bridge can
+own a **manual thermostat**: add it from the web UI with the sensor's MQTT topic,
+and the bridge takes over the setpoint/mode command topics, persists the HA-set
+target across reboots, and auto-publishes a `climate` discovery so Home Assistant
+shows a full thermostat card — no hand-written HA YAML. Then bind it to a Watts ID
+like any other zone.
+
+*Deferred (nice-to-have):* a per-zone parental lock that freezes a zone's setpoint
+against local W100 button overrides, and OTA firmware update over WiFi.
 
 ### Spoofing and Pairing Capabilities
 
@@ -142,10 +159,11 @@ The bridge supports both, and both can be driven from the web UI:
 * The bridge as a pure ambient + setpoint relay, with the Watts receiver self-regulating in Comfort mode (no per-zone control loop on the ESP32).
 * Replacement of the broken thermostat via a newly paired virtual device ID.
 * Home Assistant owning setpoints (schedules, presence, holiday mode) with W100 buttons as the per-room local override.
-* Per-zone parental lock toggling local button input on or off.
+* HA-driven manual thermostats for zones with a temperature sensor but no Z2M thermostat.
 
 **Explicitly deferred to post-MVP phases:**
 
+* Per-zone parental lock (the W100 exposes no `child_lock` in Z2M, so it needs an upstream setpoint-freeze workaround) and OTA firmware update over WiFi.
 * Cooling, dewpoint safety, cooking detection, and integration of the downstairs humidity contact. Design exists in `docs/safety/cooling-and-dewpoint.md`. Cooling is a downstairs-only concern.
 * Downstairs zone subdivision into multiple separately controlled zones.
 * Upstreaming protocol findings to mainline `rtl_433`.
