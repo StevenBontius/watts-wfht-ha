@@ -243,6 +243,47 @@ regressions and the failure modes that hardware testing doesn't exercise.
       known-good captured frames. Cheap regression tripwire; revisit if a silent
       frame/CRC regression ever bites, or before the M3 multi-zone refactor.
 
+## ESP32-C3 Super Mini port (branch `c3-supermini`) — known issues
+
+A second build target (`[env:c3_supermini]`, board `esp32-c3-devkitm-1`) was added
+alongside the classic ESP32. Confirmed working on hardware: compiles, boots,
+joins WiFi, serves the captive portal + web UI. Three C3-specific fixes were
+needed, all landed:
+
+- **USB-CDC serial** — the C3's native USB is the built-in USB-Serial/JTAG (HWCDC).
+  Both `-DARDUINO_USB_MODE=1` and `-DARDUINO_USB_CDC_ON_BOOT=1` are required; with
+  only the latter, `Serial` is undeclared and the build fails.
+- **WiFi TX power** — the C3 Super Mini's PCB antenna is poorly matched; at the
+  default 20 dBm both STA scans (`NO_AP_FOUND`) and the softAP fail. `tuneWifiTxPower()`
+  caps it to 8.5 dBm on the C3 only (no-op on the classic ESP32).
+- **Per-target CC1101 pins** — selected in `config.h` via `CONFIG_IDF_TARGET_ESP32C3`
+  (C3: SCK 4 / MISO 5 / MOSI 6 / CS 7 / GDO0 10, avoiding strapping + USB pins).
+
+Open issues / caveats (not yet resolved — parked pending representative testing):
+
+- [ ] **AsyncTCP `_accept` null-deref crash (Load access fault).** Observed once on
+      the C3 — panic in `AsyncServer::_accept` (`AsyncTCP.cpp:1619`) with `this == null`,
+      i.e. a library-level race in the accept path, not app code. AsyncTCP 3.3.2 is
+      already the latest and its task stack is already 16 KB, so the usual knobs are
+      exhausted. **Not representative:** it happened on the road (iPhone hotspot, no
+      reachable MQTT broker), so `AsyncMqttClient` — which shares the same AsyncTCP
+      task — was in a tight failing-retry loop, churning connections and aggravating
+      the race. The device auto-reboots and restores state from NVS, so it self-heals.
+      **Action:** re-evaluate on the real home LAN with the broker reachable (churn
+      should disappear). Only if it still crashes under those conditions is it worth
+      the durable fix: move HTTP to the synchronous `WebServer` and MQTT to
+      `PubSubClient` (both are AsyncTCP consumers, so a half-measure won't help).
+- [ ] **CC1101 decoupling caps.** The C3 bring-up used a bare-wire CC1101 with no
+      decoupling. Add a 100 nF ceramic + 10 µF bulk cap across the module's VDD/GND
+      before trusting TX reliability — the PA current spikes on OOK keying will
+      otherwise droop the rail and trip the C3 brownout mid-transmit. One unexplained
+      one-time boot failure during bring-up was plausibly inrush/brownout on connect.
+- [ ] **TX path not yet verified on the C3.** All C3 testing so far was without a
+      CC1101 connected. `getCC1101()` false-positived on the C3 (floating GPIO5 reads
+      mid-range); `initCC1101()` now validates the VERSION byte against `0x14`/`0x04`
+      and logs it. Actual RF transmit from the C3 still needs a wired module + rtl_433
+      confirmation.
+
 ## Post-MVP (deferred, design only)
 
 - [ ] Cooling + dewpoint safety + downstairs humidity contact (`docs/safety/cooling-and-dewpoint.md` — not yet written)

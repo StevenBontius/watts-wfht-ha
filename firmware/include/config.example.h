@@ -15,12 +15,24 @@
 #define WIFI_SSID     "your-ssid"
 #define WIFI_PASSWORD "your-password"
 
-// CC1101 wiring (ESP32 VSPI defaults)
+// CC1101 wiring. Pins are selected per target: the classic ESP32 uses its VSPI
+// defaults; the ESP32-C3 Super Mini uses GPIOs that avoid the strapping pins
+// (2/8/9) and the native USB lines (18/19). Edit the block for your board.
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+// ESP32-C3 Super Mini
+#define PIN_SCK    4
+#define PIN_MISO   5
+#define PIN_MOSI   6
+#define PIN_CS     7
+#define PIN_GDO0  10
+#else
+// classic ESP32 (VSPI defaults)
 #define PIN_SCK   18
 #define PIN_MISO  19
 #define PIN_MOSI  23
 #define PIN_CS     5
 #define PIN_GDO0   2
+#endif
 
 // MQTT broker
 #define MQTT_HOST      "192.168.1.10"   // broker IP

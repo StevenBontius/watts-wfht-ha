@@ -924,8 +924,15 @@ static void serviceScheduler() {
 static bool initCC1101() {
     ELECHOUSE_cc1101.setSpiPin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
     ELECHOUSE_cc1101.Init();
-    if (!ELECHOUSE_cc1101.getCC1101()) {
-        Serial.println("CC1101: SPI connection failed");
+    // Don't trust the library's getCC1101() -- it accepts any VERSION byte that
+    // isn't 0x00/0xFF, so a floating MISO on a disconnected/flaky module reads
+    // back garbage and passes (notably on the C3, where a floating GPIO5 lands
+    // mid-range). Check VERSION against the real CC1101 values and log the byte,
+    // so a missing or miswired module fails loudly instead of pretending ready.
+    uint8_t version = ELECHOUSE_cc1101.SpiReadStatus(CC1101_VERSION);
+    if (version != 0x14 && version != 0x04) {
+        Serial.printf("CC1101: SPI connection failed (VERSION=0x%02X, expected "
+                      "0x14/0x04 -- check wiring/power)\n", version);
         return false;
     }
 
@@ -1864,6 +1871,18 @@ static void setupPortalRoutes() {
     });
 }
 
+// ESP32-C3 Super Mini boards ship with a poorly impedance-matched PCB antenna;
+// at the default 20 dBm the mismatch reflects enough power to cripple both STA
+// scans (endless NO_AP_FOUND) and the softAP (invisible / unjoinable). Capping
+// TX power to 8.5 dBm is the well-known community fix. No-op on the classic
+// ESP32, which has a proper antenna and wants full power. Call after the radio
+// is up (post softAP()/begin()).
+static void tuneWifiTxPower() {
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
+#endif
+}
+
 static void startPortal() {
     portalActive = true;
     WiFi.mode(WIFI_AP);
@@ -1871,6 +1890,7 @@ static void startPortal() {
     snprintf(ap, sizeof(ap), "watts-bridge-%04X",
              (uint16_t)(ESP.getEfuseMac() >> 32));
     WiFi.softAP(ap);
+    tuneWifiTxPower();
     IPAddress ip = WiFi.softAPIP();
     dnsServer.start(53, "*", ip);   // catch-all so every lookup resolves to us
     setupPortalRoutes();
@@ -2478,6 +2498,7 @@ void setup() {
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(netCfg.wifiSsid, netCfg.wifiPass);
+    tuneWifiTxPower();
     Serial.printf("WiFi connecting to \"%s\"", netCfg.wifiSsid);
     uint32_t startedAt = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 20000) {
