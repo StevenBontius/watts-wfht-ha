@@ -52,6 +52,8 @@ silent or reports bit-inverted CRC failures.
 
 ## Architecture
 
+Hardware (MCU, CC1101 module, wiring, antenna) is documented in `docs/HARDWARE.md`.
+
 The system has two layers:
 
 **Protocol layer** (fully characterized, documented in `docs/WATTS_WFHT_RF_PROTOCOL.md`):

@@ -20,7 +20,7 @@
 #define PIN_MISO  19
 #define PIN_MOSI  23
 #define PIN_CS     5
-#define PIN_GDO0   2
+#define PIN_GDO0   4
 
 // MQTT broker
 #define MQTT_HOST      "192.168.1.10"   // broker IP

@@ -16,6 +16,8 @@ Assistant discovery entities. The debug/test HTTP endpoints are gated behind a
 validation on hardware, plus deferred nice-to-haves (per-zone parental lock, OTA
 firmware update) — see [`docs/ROADMAP.md`](/docs/ROADMAP.md).
 
+Hardware — MCU, RF module, wiring and antenna selection — is documented in [`docs/HARDWARE.md`](/docs/HARDWARE.md).
+
 The reverse engineering process of the wireless communication can be found here: [Watts WFHT RF Protocol Reverse Engineering](/docs/WATTS_WFHT_RF_PROTOCOL.md)
 
 All reverse engineering findings for capturing packets have been incorporated into this [forked rtl_433 decoder](https://github.com/StevenBontius/rtl_433). Pending merge with mainline `rtl-433`.
